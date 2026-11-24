@@ -8,13 +8,17 @@
  * hello.h), pošle HELLO (klient = node_id 0, modul CLIENT) a pak čte
  * příkazy ze stdin, jeden na řádek:
  *
+ *     stat <cesta>           atributy souboru/adresáře
+ *     ls [cesta]             obsah adresáře (výchozí /)
+ *     mkdir <cesta> [mód]    nový adresář, mód osmičkově (výchozí 755)
+ *     rmdir <cesta>          smaže prázdný adresář
  *     status       stav modulů uzlu a jejich propojení (STATUS přes Auth)
  *     ping [N]     N pingů (1..1000, výchozí 1), vypíše RTT
  *     help         seznam příkazů
  *     quit, exit   konec (stejně jako Ctrl-D)
  *
  * Protože čte stdin po řádcích, funguje i neinteraktivně:
- *     printf "ping 5\nquit\n" | kivfs-client localhost 9000
+ *     printf "mkdir /a\nls /\nquit\n" | kivfs-client localhost 30001
  * (prompt "kivfs> " se pak nevypisuje).
  *
  * Exit kódy: 0 = konec příkazem/EOF, 1 = chyba spojení, 2 = špatné použití.
@@ -42,12 +46,13 @@
 #include "net/channel.h"
 #include "proto/diag.h"
 #include "proto/errors.h"
+#include "proto/fsproto.h"
 #include "proto/hello.h"
 #include "proto/packet.h"
 #include "proto/protocol.h"
 #include "net/socket.h"
 
-#define LINE_MAX_LEN   256     /* včetně '\n' a '\0' */
+#define LINE_MAX_LEN   (KIVFS_PATH_MAX + 64)   /* nejdelší cesta + příkaz; včetně '\n' a '\0' */
 #define MAX_ARGS       8
 #define PING_MAX_COUNT 1000
 
@@ -302,6 +307,163 @@ static enum cmd_result cmd_ping(struct client *c, int argc, char **argv)
     return res;
 }
 
+/* ------------------------------------------------------------------ */
+/* Operace souborového systému                                         */
+/* ------------------------------------------------------------------ */
+
+/* Pošle operaci [path] (+ [u32 mode], je-li mode >= 0). Status != OK
+ * vypíše jako "<příkaz>: <cesta>: <STATUS>" a vrátí *resp prázdný.
+ * *ok = 1 jen při OK (pak volající *resp uvolní). */
+static enum cmd_result fs_call(struct client *c, const char *cmd, uint16_t code,
+                               const char *path, long mode,
+                               struct kivfs_packet *resp, int *ok)
+{
+    struct kivfs_packet req;
+    *ok = 0;
+    kivfs_pkt_init(&req, code, next_ts(c));
+    if (kivfs_pkt_add_bytes(&req, path, (uint32_t)strlen(path)) != KIVFS_OK
+        || (mode >= 0 && kivfs_pkt_add_u32(&req, (uint32_t)mode) != KIVFS_OK)) {
+        fprintf(stderr, "%s: příliš dlouhá cesta\n", cmd);
+        kivfs_pkt_free(&req);
+        return CMD_OK;
+    }
+    int rc = do_call(c, &req, resp);
+    kivfs_pkt_free(&req);
+    if (rc != KIVFS_OK)
+        return CMD_FATAL;
+    if (resp->header.return_value != KIVFS_STATUS_OK) {
+        fprintf(stderr, "%s: %s: %s\n", cmd, path, kivfs_status_str(resp->header.return_value));
+        kivfs_pkt_free(resp);
+        return CMD_OK;
+    }
+    *ok = 1;
+    return CMD_OK;
+}
+
+/* "drwxr-xr-x" */
+static void mode_str(uint32_t mode, char out[11])
+{
+    uint32_t t = mode & KIVFS_MODE_TYPE_MASK;
+    out[0] = t == KIVFS_MODE_DIR ? 'd' : t == KIVFS_MODE_FILE ? '-' : '?';
+    for (int i = 0; i < 9; i++)
+        out[1 + i] = (mode & (0400u >> i)) ? "rwxrwxrwx"[i] : '-';
+    out[10] = '\0';
+}
+
+static void time_str(uint64_t ms, char *out, size_t n)
+{
+    time_t t = (time_t)(ms / 1000u);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(out, n, "%Y-%m-%d %H:%M:%S", &tm);
+}
+
+static enum cmd_result cmd_stat(struct client *c, int argc, char **argv)
+{
+    if (argc != 2) {
+        fprintf(stderr, "použití: stat <cesta>\n");
+        return CMD_OK;
+    }
+    struct kivfs_packet resp;
+    int ok;
+    enum cmd_result res = fs_call(c, "stat", KIVFS_REQ_STAT, argv[1], -1, &resp, &ok);
+    if (!ok)
+        return res;
+
+    struct kivfs_pkt_reader r;
+    struct kivfs_attr a;
+    uint64_t ref;
+    kivfs_pkt_reader_init(&r, &resp);
+    if (kivfs_pkt_read_u64(&r, &ref) != KIVFS_OK || kivfs_attr_read(&r, &a) != KIVFS_OK) {
+        fprintf(stderr, "stat: neplatná odpověď\n");
+    } else {
+        char m[11], mt[32], ct[32];
+        mode_str(a.mode, m);
+        time_str(a.mtime_ms, mt, sizeof mt);
+        time_str(a.ctime_ms, ct, sizeof ct);
+        printf("  cesta:  %s\n  id:     %llu\n  typ:    %s\n  práva:  %s (%04o)\n"
+               "  vlastník: uid %u, gid %u\n  velikost: %llu B\n"
+               "  změněno: %s\n  vytvořeno: %s\n",
+               argv[1], (unsigned long long)a.id,
+               m[0] == 'd' ? "adresář" : m[0] == '-' ? "soubor" : "?",
+               m + 1, (unsigned)(a.mode & KIVFS_MODE_PERM_MASK),
+               (unsigned)a.uid, (unsigned)a.gid, (unsigned long long)a.size, mt, ct);
+    }
+    kivfs_pkt_free(&resp);
+    return res;
+}
+
+static enum cmd_result cmd_ls(struct client *c, int argc, char **argv)
+{
+    if (argc > 2) {
+        fprintf(stderr, "použití: ls [cesta]\n");
+        return CMD_OK;
+    }
+    const char *path = argc == 2 ? argv[1] : "/";
+    struct kivfs_packet resp;
+    int ok;
+    enum cmd_result res = fs_call(c, "ls", KIVFS_REQ_LIST, path, -1, &resp, &ok);
+    if (!ok)
+        return res;
+
+    struct kivfs_pkt_reader r;
+    uint64_t ref, id;
+    uint32_t mode, nlen;
+    const char *name;
+    int n = 0, rc;
+    kivfs_pkt_reader_init(&r, &resp);
+    kivfs_pkt_read_u64(&r, &ref);
+    while ((rc = kivfs_entry_read(&r, &id, &mode, &name, &nlen)) == KIVFS_OK) {
+        char m[11];
+        mode_str(mode, m);
+        printf("  %s %8llu  %.*s%s\n", m, (unsigned long long)id, (int)nlen, name,
+               m[0] == 'd' ? "/" : "");
+        n++;
+    }
+    if (rc != KIVFS_EEND)
+        fprintf(stderr, "ls: neplatná odpověď\n");
+    printf("  položek: %d\n", n);
+    kivfs_pkt_free(&resp);
+    return res;
+}
+
+static enum cmd_result cmd_mkdir(struct client *c, int argc, char **argv)
+{
+    unsigned long mode = 0755;
+    if (argc < 2 || argc > 3) {
+        fprintf(stderr, "použití: mkdir <cesta> [mód osmičkově, výchozí 755]\n");
+        return CMD_OK;
+    }
+    if (argc == 3) {
+        char *end;
+        mode = strtoul(argv[2], &end, 8);
+        if (*argv[2] == '\0' || *end != '\0' || mode > 07777) {
+            fprintf(stderr, "mkdir: neplatný mód '%s' (např. 755)\n", argv[2]);
+            return CMD_OK;
+        }
+    }
+    struct kivfs_packet resp;
+    int ok;
+    enum cmd_result res = fs_call(c, "mkdir", KIVFS_REQ_MKDIR, argv[1], (long)mode, &resp, &ok);
+    if (ok)
+        kivfs_pkt_free(&resp);
+    return res;
+}
+
+static enum cmd_result cmd_rmdir(struct client *c, int argc, char **argv)
+{
+    if (argc != 2) {
+        fprintf(stderr, "použití: rmdir <cesta>\n");
+        return CMD_OK;
+    }
+    struct kivfs_packet resp;
+    int ok;
+    enum cmd_result res = fs_call(c, "rmdir", KIVFS_REQ_RMDIR, argv[1], -1, &resp, &ok);
+    if (ok)
+        kivfs_pkt_free(&resp);
+    return res;
+}
+
 static enum cmd_result cmd_help(struct client *c, int argc, char **argv);
 
 static enum cmd_result cmd_quit(struct client *c, int argc, char **argv)
@@ -318,10 +480,14 @@ struct command {
 };
 
 static const struct command COMMANDS[] = {
-    { "status", cmd_status, "status       stav modulů uzlu a jejich propojení" },
-    { "ping",  cmd_ping,  "ping [N]     N pingů (1..1000, výchozí 1), vypíše RTT" },
-    { "help",  cmd_help,  "help         tento přehled" },
-    { "quit",  cmd_quit,  "quit, exit   konec (také Ctrl-D)" },
+    { "stat",  cmd_stat,  "stat <cesta>           atributy souboru/adresáře" },
+    { "ls",    cmd_ls,    "ls [cesta]             obsah adresáře (výchozí /)" },
+    { "mkdir", cmd_mkdir, "mkdir <cesta> [mód]    nový adresář (mód osmičkově, výchozí 755)" },
+    { "rmdir", cmd_rmdir, "rmdir <cesta>          smaže prázdný adresář" },
+    { "status", cmd_status, "status                 stav modulů uzlu a jejich propojení" },
+    { "ping",  cmd_ping,  "ping [N]               N pingů (1..1000, výchozí 1), vypíše RTT" },
+    { "help",  cmd_help,  "help                   tento přehled" },
+    { "quit",  cmd_quit,  "quit, exit             konec (také Ctrl-D)" },
     { "exit",  cmd_quit,  NULL },       /* alias, v nápovědě se nevypisuje */
 };
 #define N_COMMANDS (sizeof COMMANDS / sizeof COMMANDS[0])

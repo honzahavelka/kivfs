@@ -26,7 +26,7 @@ add_library(common_lib
     common/proto/packet.c      common/proto/packet.h
     common/proto/hello.c       common/proto/hello.h
     common/proto/diag.c        common/proto/diag.h
-                               common/proto/fsproto.h
+    common/proto/fsproto.c     common/proto/fsproto.h
     common/net/socket.c        common/net/socket.h
     common/net/channel.c       common/net/channel.h
     common/util/queue.c        common/util/queue.h
@@ -58,11 +58,23 @@ target_link_libraries(kivfs-client PRIVATE common_lib)
 # Testy (spuštění: ctest v build adresáři)
 # ---------------------------------------------------------------------
 enable_testing()
-foreach(t protocol channel queue hello)
+foreach(t protocol channel queue hello fsproto)
     add_executable(test_${t} tests/unit/test_${t}.c)
     target_link_libraries(test_${t} PRIVATE common_lib)
     add_test(NAME ${t} COMMAND test_${t})
 endforeach()
+
+# mock úložiště DB je čisté C bez sítě – test běží i na macOS
+add_executable(test_db_mock tests/unit/test_db_mock.c server/db/backend_mock.c)
+target_include_directories(test_db_mock PRIVATE server)
+target_link_libraries(test_db_mock PRIVATE common_lib)
+add_test(NAME db_mock COMMAND test_db_mock)
+
+# kontrola práv VFS – čisté funkce, také přenositelné
+add_executable(test_vfs_perm tests/unit/test_vfs_perm.c server/vfs/perm.c)
+target_include_directories(test_vfs_perm PRIVATE server)
+target_link_libraries(test_vfs_perm PRIVATE common_lib)
+add_test(NAME vfs_perm COMMAND test_vfs_perm)
 
 if(TARGET server_core)
     foreach(t reactor reactor_out events config)
@@ -83,6 +95,8 @@ if(TARGET server_core)
         add_executable(kivfs-${m} server/${m}/main.c)
         target_link_libraries(kivfs-${m} PRIVATE server_core)
     endforeach()
+    target_sources(kivfs-vfs PRIVATE server/vfs/perm.c         server/vfs/perm.h)
+    target_sources(kivfs-db  PRIVATE server/db/backend_mock.c  server/db/backend.h)
 
     add_executable(kivfs-check tools/check.c)
     target_link_libraries(kivfs-check PRIVATE server_core)
@@ -94,4 +108,12 @@ if(TARGET server_core)
     set_tests_properties(cluster_local PROPERTIES
         TIMEOUT 120
         RUN_SERIAL TRUE)   # pevné porty 310xx–330xx
+
+    # Scénář: operace FS přes klienta na jednom uzlu, výpadek a obnova DB
+    add_test(NAME fs_local
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/scenarios/fs-local.sh
+                     ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/conf/local/node1.ini)
+    set_tests_properties(fs_local PROPERTIES
+        TIMEOUT 120
+        RUN_SERIAL TRUE)
 endif()

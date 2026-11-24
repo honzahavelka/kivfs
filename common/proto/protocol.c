@@ -57,6 +57,8 @@ const char *kivfs_status_str(int16_t status)
     case KIVFS_STATUS_INTERNAL:      return "INTERNAL";
     case KIVFS_STATUS_REJECTED:      return "REJECTED";
     case KIVFS_STATUS_UNAVAILABLE:   return "UNAVAILABLE";
+    case KIVFS_STATUS_NOT_DIR:       return "NOT_DIR";
+    case KIVFS_STATUS_NOT_EMPTY:     return "NOT_EMPTY";
     }
     return "UNKNOWN_STATUS";
 }

@@ -52,7 +52,8 @@ struct kivfs_ctx {
     uint32_t uid, gid;
 };
 
-/* Přidání na konec paketu: KIVFS_OK / KIVFS_ENOMEM / KIVFS_ETOOBIG. */
+/* Přidání na konec paketu: KIVFS_OK / KIVFS_ENOMEM / KIVFS_ETOOBIG
+ * (u entry navíc KIVFS_EINVAL pro jméno delší než KIVFS_NAME_MAX). */
 int kivfs_attr_add  (struct kivfs_packet *p, const struct kivfs_attr *a);
 int kivfs_ctx_add   (struct kivfs_packet *p, const struct kivfs_ctx *c);
 int kivfs_mknode_add(struct kivfs_packet *p, uint32_t mode, uint32_t uid, uint32_t gid);

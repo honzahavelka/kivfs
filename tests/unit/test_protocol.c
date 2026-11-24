@@ -320,6 +320,10 @@ static void test_status_str(void)
     CHECK(strcmp(kivfs_status_str(KIVFS_STATUS_OK), "OK") == 0);
     CHECK(strcmp(kivfs_status_str(KIVFS_STATUS_BUSY), "BUSY") == 0);
     CHECK(strcmp(kivfs_status_str(KIVFS_STATUS_INTERNAL), "INTERNAL") == 0);
+    /* každý definovaný stav musí mít jméno (chyběl-li by, klient vypíše
+     * UNKNOWN_STATUS místo NOT_EMPTY apod.) */
+    for (int st = KIVFS_STATUS_NOT_EMPTY; st <= KIVFS_STATUS_OK; st++)
+        CHECK(strcmp(kivfs_status_str((int16_t)st), "UNKNOWN_STATUS") != 0);
     /* hodnota od protistrany může být cokoli */
     CHECK(strcmp(kivfs_status_str(1234), "UNKNOWN_STATUS") == 0);
     CHECK(strcmp(kivfs_status_str(-32768), "UNKNOWN_STATUS") == 0);

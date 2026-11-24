@@ -24,9 +24,19 @@ Pravidla, která se snadno přehlédnou:
 - **Jeden stroj** (`local/`): `tests/scenarios/cluster-local.sh <build>` – spustí
   15 procesů, ověří propojení, zastaví a znovu spustí `sync@node2`
   (výpadek a obnova), vše ukončí. Běží i v `ctest` jako `cluster_local`.
+- **Operace FS na jednom uzlu** (`local/node1.ini`): `tests/scenarios/fs-local.sh <build>`
+  – mkdir/ls/stat/rmdir přes klienta, chyby, výpadek a obnova DB (ctest `fs_local`).
+- Ručně: spustit 5 modulů uzlu a `kivfs-client 127.0.0.1 31001`
+  (příkazy `mkdir`, `ls`, `stat`, `rmdir`, `status`, `help`).
 - **Tři kontejnery** (`3nodes/`):
   `docker compose -f docker/docker-compose.yml up --build --abort-on-container-exit --exit-code-from check`
   – exit kód je výsledek `kivfs-check`.
 - Ruční kontrola běžícího clusteru:
   `kivfs-check -c node1.ini -c node2.ini -c node3.ini --wait 20`
   (klient smí jen do Auth, STATUS projde kaskádou Auth → Sync → VFS → DB, FS).
+
+## Klíče specifické pro moduly
+
+| Sekce | Klíč | Význam |
+|---|---|---|
+| `[db]` | `backend` | úložiště metadat: `mock` (výchozí, strom v paměti – po restartu prázdný) |

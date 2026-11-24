@@ -29,9 +29,10 @@
 #define BACKOFF_MIN_MS     100
 #define BACKOFF_MAX_MS     5000
 #define MAX_OPS            64
+#define MAX_CALLS          1024    /* rozpracovaná kivfs_mod_call */
 #define MAX_LINKS          (KIVFS_MAX_NODES + KIVFS_MOD_COUNT)
 
-enum { TAG_START = 1, TAG_HELLO, TAG_RECONNECT, TAG_OP };
+enum { TAG_START = 1, TAG_HELLO, TAG_RECONNECT, TAG_OP, TAG_CALL };
 
 #define TAG(kind, idx, gen) (((uint64_t)(kind) << 56) | ((uint64_t)((idx) & 0xFFFFFFu) << 32) \
                              | (uint32_t)(gen))
@@ -69,8 +70,23 @@ struct op {
     int                 waiting;        /* kolik odpovědí ještě chybí */
 };
 
+/* Rozpracované kivfs_mod_call. */
+struct call {
+    int             active;
+    uint32_t        gen;
+    kivfs_mod_cont  cont;
+    void           *state;
+};
+
+/* Stav kivfs_mod_forward: komu a na co odpovědět. */
+struct fwd {
+    kivfs_conn_id       to;
+    struct kivfs_header orig;          /* hlavička původního požadavku (kód + ref) */
+};
+
 struct kivfs_mod {
     const struct kivfs_mod_ops *ops;
+    void                       *user;  /* stav konkrétního modulu */
     struct kivfs_modconf        mc;
     struct kivfs_hello          me;
     struct kivfs_ev            *ev;
@@ -81,6 +97,8 @@ struct kivfs_mod {
     size_t                      nlinks;
     struct peer                *peers;  /* [mc.max_conns] */
     struct op                   ops_tab[MAX_OPS];
+    struct call                 calls[MAX_CALLS];
+    size_t                      calls_hint;   /* kde začít hledat volný slot */
 };
 
 /* ------------------------------------------------------------------ */
@@ -133,8 +151,8 @@ static const char *close_reason_str(int reason)
 /* Odpovědi                                                            */
 /* ------------------------------------------------------------------ */
 
-static void reply_status(struct kivfs_mod *m, kivfs_conn_id conn,
-                         const struct kivfs_packet *req, int16_t status)
+void kivfs_mod_reply_status(struct kivfs_mod *m, kivfs_conn_id conn,
+                            const struct kivfs_packet *req, int16_t status)
 {
     struct kivfs_packet resp;
     if (kivfs_pkt_init_response(&resp, req, ++m->clock, status) == KIVFS_OK)
@@ -153,7 +171,7 @@ static void reply_ping(struct kivfs_mod *m, kivfs_conn_id conn, const struct kiv
     while (kivfs_pkt_read_bytes(&rd, &b, &len) == KIVFS_OK) {
         if (kivfs_pkt_add_bytes(&resp, b, len) != KIVFS_OK) {
             kivfs_pkt_free(&resp);
-            reply_status(m, conn, req, KIVFS_STATUS_MALFORMED);
+            kivfs_mod_reply_status(m, conn, req, KIVFS_STATUS_MALFORMED);
             return;
         }
     }
@@ -167,8 +185,11 @@ static void reply_ping(struct kivfs_mod *m, kivfs_conn_id conn, const struct kiv
 static void link_schedule_retry(struct kivfs_mod *m, struct link *l)
 {
     size_t idx = (size_t)(l - m->links);
-    if (kivfs_ev_timer(m->ev, l->backoff_ms, TAG(TAG_RECONNECT, idx, l->gen)) != KIVFS_OK)
-        mlog(m, "BUG: nelze naplánovat nový pokus o spojení");
+    int rc = kivfs_ev_timer(m->ev, l->backoff_ms, TAG(TAG_RECONNECT, idx, l->gen));
+    /* EIO = reactor už skončil (modul se ukončuje a protistrana zavřela
+     * dřív, než přišel náš SHUTDOWN) – nic neobnovovat */
+    if (rc != KIVFS_OK && rc != KIVFS_EIO)
+        mlog(m, "BUG: nelze naplánovat nový pokus o spojení (%s)", kivfs_strerror(rc));
     l->backoff_ms *= 2;
     if (l->backoff_ms > BACKOFF_MAX_MS)
         l->backoff_ms = BACKOFF_MAX_MS;
@@ -333,7 +354,7 @@ static void status_start(struct kivfs_mod *m, kivfs_conn_id from, const struct k
     size_t i;
     for (i = 0; i < MAX_OPS && m->ops_tab[i].active; i++) { }
     if (i == MAX_OPS) {
-        reply_status(m, from, req, KIVFS_STATUS_BUSY);
+        kivfs_mod_reply_status(m, from, req, KIVFS_STATUS_BUSY);
         return;
     }
     struct op *o = &m->ops_tab[i];
@@ -343,7 +364,7 @@ static void status_start(struct kivfs_mod *m, kivfs_conn_id from, const struct k
         return;
     if (kivfs_diag_add(&o->resp, &d) != KIVFS_OK) {
         kivfs_pkt_free(&o->resp);
-        reply_status(m, from, req, KIVFS_STATUS_INTERNAL);
+        kivfs_mod_reply_status(m, from, req, KIVFS_STATUS_INTERNAL);
         return;
     }
     o->active  = 1;
@@ -389,6 +410,126 @@ static void on_status_response(struct kivfs_mod *m, struct kivfs_event *e)
     }
     if (--o->waiting == 0)
         op_finish(m, o);
+}
+
+/* ------------------------------------------------------------------ */
+/* API pro moduly: stav, odpovědi, volání závislostí                   */
+/* ------------------------------------------------------------------ */
+
+void *kivfs_mod_user(const struct kivfs_mod *m)            { return m->user; }
+void  kivfs_mod_set_user(struct kivfs_mod *m, void *user)   { m->user = user; }
+const struct kivfs_modconf *kivfs_mod_conf(const struct kivfs_mod *m) { return &m->mc; }
+uint64_t kivfs_mod_next_ts(struct kivfs_mod *m)            { return ++m->clock; }
+
+void kivfs_mod_reply(struct kivfs_mod *m, kivfs_conn_id to, struct kivfs_packet *resp)
+{
+    kivfs_reactor_send(m->r, to, resp);            /* převezme resp vždy */
+}
+
+int kivfs_mod_call(struct kivfs_mod *m, enum kivfs_module to, struct kivfs_packet *req,
+                   int timeout_ms, kivfs_mod_cont cont, void *state)
+{
+    struct link *l = NULL;
+    for (size_t i = 0; i < m->nlinks; i++)
+        if (m->links[i].is_dep && m->links[i].module == (uint32_t)to)
+            l = &m->links[i];
+    if (l == NULL || cont == NULL) {
+        kivfs_pkt_free(req);
+        return KIVFS_EINVAL;
+    }
+    if (l->state != KIVFS_LINK_UP) {               /* nečekat na timeout */
+        kivfs_pkt_free(req);
+        return KIVFS_ENOTREADY;
+    }
+
+    /* volný slot – hledá se od posledního obsazeného (obvykle hned) */
+    size_t idx = MAX_CALLS;
+    for (size_t k = 0; k < MAX_CALLS; k++) {
+        size_t i = (m->calls_hint + k) % MAX_CALLS;
+        if (!m->calls[i].active) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == MAX_CALLS) {
+        kivfs_pkt_free(req);
+        return KIVFS_EAGAIN;
+    }
+    struct call *c = &m->calls[idx];
+    c->gen++;
+    req->header.timestamp = ++m->clock;
+    int rc = kivfs_ev_request(m->ev, l->conn, req, TAG(TAG_CALL, idx, c->gen), timeout_ms);
+    if (rc != KIVFS_OK)
+        return rc;                                 /* EAGAIN (fronta), ... – cont nepřijde */
+    c->active  = 1;
+    c->cont    = cont;
+    c->state   = state;
+    m->calls_hint = (idx + 1) % MAX_CALLS;
+    return KIVFS_OK;
+}
+
+static void on_call_response(struct kivfs_mod *m, struct kivfs_event *e)
+{
+    uint32_t idx = TAG_IDX(e->tag);
+    if (idx >= MAX_CALLS)
+        return;
+    struct call *c = &m->calls[idx];
+    if (!c->active || c->gen != TAG_GEN(e->tag))
+        return;
+    c->active = 0;                                 /* cont smí hned volat znovu */
+    c->cont(m, c->state, e->err, e->err == KIVFS_OK ? &e->pkt : NULL);
+}
+
+static void fwd_cont(struct kivfs_mod *m, void *state, int err, struct kivfs_packet *resp)
+{
+    struct fwd *f = state;
+    struct kivfs_packet orig = { .header = f->orig };   /* init_response čte jen hlavičku */
+    struct kivfs_packet out;
+    int16_t status = err == KIVFS_OK ? resp->header.return_value : KIVFS_STATUS_UNAVAILABLE;
+
+    if (kivfs_pkt_init_response(&out, &orig, ++m->clock, status) == KIVFS_OK) {
+        if (err == KIVFS_OK) {
+            /* záznamy za ref volaného -> za náš ref */
+            struct kivfs_pkt_reader rd;
+            const uint8_t *b;
+            uint32_t len;
+            uint64_t ref;
+            kivfs_pkt_reader_init(&rd, resp);
+            if (kivfs_pkt_read_u64(&rd, &ref) == KIVFS_OK) {
+                while (kivfs_pkt_read_bytes(&rd, &b, &len) == KIVFS_OK) {
+                    if (kivfs_pkt_add_bytes(&out, b, len) != KIVFS_OK) {
+                        kivfs_pkt_free(&out);
+                        kivfs_pkt_init_response(&out, &orig, ++m->clock, KIVFS_STATUS_INTERNAL);
+                        break;
+                    }
+                }
+            }
+        }
+        kivfs_reactor_send(m->r, f->to, &out);
+    }
+    free(f);
+}
+
+void kivfs_mod_forward(struct kivfs_mod *m, const struct kivfs_mod_peer *from,
+                       const struct kivfs_packet *orig, struct kivfs_packet *fwd,
+                       enum kivfs_module to, int timeout_ms)
+{
+    struct fwd *f = malloc(sizeof *f);
+    if (f == NULL) {
+        kivfs_pkt_free(fwd);
+        kivfs_mod_reply_status(m, from->conn, orig, KIVFS_STATUS_INTERNAL);
+        return;
+    }
+    f->to   = from->conn;
+    f->orig = orig->header;
+    int rc = kivfs_mod_call(m, to, fwd, timeout_ms, fwd_cont, f);
+    if (rc != KIVFS_OK) {
+        kivfs_mod_reply_status(m, from->conn, orig,
+                               rc == KIVFS_ENOTREADY ? KIVFS_STATUS_UNAVAILABLE
+                               : rc == KIVFS_EAGAIN  ? KIVFS_STATUS_BUSY
+                                                     : KIVFS_STATUS_INTERNAL);
+        free(f);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -485,7 +626,7 @@ static void on_request(struct kivfs_mod *m, struct kivfs_event *e)
         return;
     }
     if (!p->hello) {                               /* nejdřív se představ */
-        reply_status(m, e->conn, &e->pkt, KIVFS_STATUS_ACCESS_DENIED);
+        kivfs_mod_reply_status(m, e->conn, &e->pkt, KIVFS_STATUS_ACCESS_DENIED);
         kivfs_reactor_close_conn(m->r, e->conn);
         return;
     }
@@ -502,7 +643,7 @@ static void on_request(struct kivfs_mod *m, struct kivfs_event *e)
             if (m->ops->on_request(m, &from, &e->pkt))
                 return;
         }
-        reply_status(m, e->conn, &e->pkt, KIVFS_STATUS_UNKNOWN_REQ);
+        kivfs_mod_reply_status(m, e->conn, &e->pkt, KIVFS_STATUS_UNKNOWN_REQ);
     }
 }
 
@@ -542,6 +683,8 @@ static void handle_event(struct kivfs_mod *m, struct kivfs_event *e)
             on_hello_response(m, e);
         else if (TAG_KIND(e->tag) == TAG_OP)
             on_status_response(m, e);
+        else if (TAG_KIND(e->tag) == TAG_CALL)
+            on_call_response(m, e);
         break;
     case KIVFS_EV_TIMER:
         if (TAG_KIND(e->tag) == TAG_RECONNECT && TAG_IDX(e->tag) < m->nlinks) {
@@ -593,18 +736,25 @@ static void *signal_main(void *arg)
 /* Start                                                               */
 /* ------------------------------------------------------------------ */
 
+/* Načte a zvaliduje konfiguraci a zavolá ops->init (ten může číst
+ * extra_keys z cfg). */
 static int load_config(struct kivfs_mod *m, const char *path)
 {
-    struct kivfs_config *c;
+    struct kivfs_config *c = NULL;
     char err[512];
+    int rc = 0;
     if (kivfs_config_load(path, &c, err, sizeof err) != KIVFS_OK
         || kivfs_modconf_from(c, m->ops->self, m->ops->extra_keys, &m->mc,
                               err, sizeof err) != KIVFS_OK) {
         fprintf(stderr, "kivfs-%s: %s\n", kivfs_module_name(m->ops->self), err);
-        return -1;
+        rc = -1;
+    } else if (m->ops->init != NULL && m->ops->init(m, c) != 0) {
+        fprintf(stderr, "kivfs-%s: inicializace modulu selhala\n",
+                kivfs_module_name(m->ops->self));
+        rc = -1;
     }
     kivfs_config_free(c);
-    return 0;
+    return rc;
 }
 
 static void setup_links(struct kivfs_mod *m)
@@ -666,6 +816,8 @@ int kivfs_module_main(int argc, char **argv, const struct kivfs_mod_ops *ops)
     }
     m->peers = calloc(m->mc.max_conns, sizeof *m->peers);
     if (m->peers == NULL) {
+        if (ops->fini != NULL)
+            ops->fini(m);
         free(m);
         return 1;
     }
@@ -700,6 +852,8 @@ int kivfs_module_main(int argc, char **argv, const struct kivfs_mod_ops *ops)
     }
     if (rc != KIVFS_OK) {
         kivfs_ev_destroy(m->ev);
+        if (ops->fini != NULL)
+            ops->fini(m);
         free(m->peers);
         free(m);
         return 1;
@@ -724,6 +878,8 @@ int kivfs_module_main(int argc, char **argv, const struct kivfs_mod_ops *ops)
     pthread_join(sigth, NULL);
     for (size_t i = 0; i < MAX_OPS; i++)
         kivfs_pkt_free(&m->ops_tab[i].resp);
+    if (ops->fini != NULL)
+        ops->fini(m);
     mlog(m, "ukončen");
     kivfs_reactor_destroy(m->r);
     kivfs_ev_destroy(m->ev);

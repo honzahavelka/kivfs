@@ -46,9 +46,10 @@ struct kivfs_dbb_ops {
                     int (*emit)(void *ud, uint64_t id, uint32_t mode, const char *name),
                     void *ud);
 
-    /* smazání; NOT_FOUND, NOT_EMPTY, ACCESS_DENIED ("/"), NOT_DIR
-     * (zatím jen adresáře – rmdir) */
-    int16_t (*rmnode)(struct kivfs_dbb *b, const char *path);
+    /* smazání; now_ms = nový mtime rodiče
+     * NOT_FOUND, NOT_EMPTY, ACCESS_DENIED ("/"), NOT_DIR (zatím jen
+     * adresáře – rmdir) */
+    int16_t (*rmnode)(struct kivfs_dbb *b, const char *path, uint64_t now_ms);
 
     void (*close)(struct kivfs_dbb *b);
 };
