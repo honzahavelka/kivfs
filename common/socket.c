@@ -275,6 +275,59 @@ int kivfs_sock_connect(const char *host, uint16_t port, int timeout_ms)
     return rc;
 }
 
+int kivfs_sock_resolve(const char *host, uint16_t port,
+                       struct sockaddr_storage *out, socklen_t *out_len)
+{
+    struct addrinfo *res;
+    int rc = resolve(host, port, 0, &res);
+    if (rc != KIVFS_OK)
+        return rc;
+    if (res == NULL || res->ai_addrlen > sizeof *out) {
+        if (res != NULL)
+            freeaddrinfo(res);
+        return KIVFS_ERESOLVE;
+    }
+    memset(out, 0, sizeof *out);
+    memcpy(out, res->ai_addr, res->ai_addrlen);
+    *out_len = (socklen_t)res->ai_addrlen;
+    freeaddrinfo(res);
+    return KIVFS_OK;
+}
+
+int kivfs_sock_connect_start(const struct sockaddr *addr, socklen_t addrlen)
+{
+    int fd = socket(addr->sa_family, SOCK_STREAM, 0);
+    if (fd < 0)
+        return KIVFS_EIO;
+    if (kivfs_sock_set_nonblocking(fd) != KIVFS_OK
+        || kivfs_sock_set_nodelay(fd) != KIVFS_OK) {
+        close_keep_errno(fd);
+        return KIVFS_EIO;
+    }
+    set_nosigpipe(fd);
+
+    /* 0 = navázáno hned (bývá u loopbacku), EINPROGRESS/EINTR = navazuje
+     * se na pozadí. V obou případech výsledek ověří connect_finish, až
+     * bude socket zapisovatelný (navázaný socket je zapisovatelný hned). */
+    if (connect(fd, addr, addrlen) == 0 || errno == EINPROGRESS || errno == EINTR)
+        return fd;
+    close_keep_errno(fd);
+    return KIVFS_EIO;
+}
+
+int kivfs_sock_connect_finish(int fd)
+{
+    int err = 0;
+    socklen_t err_len = sizeof err;
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) < 0)
+        return KIVFS_EIO;
+    if (err != 0) {
+        errno = err;
+        return KIVFS_EIO;
+    }
+    return KIVFS_OK;
+}
+
 void kivfs_sock_close(int *fd)
 {
     if (*fd >= 0) {
@@ -428,6 +481,28 @@ long kivfs_sock_write_some(int fd, const void *buf, size_t len)
         return 0;
     for (;;) {
         ssize_t n = send(fd, buf, len, SEND_FLAGS);
+        if (n >= 0)
+            return (long)n;
+        if (errno == EINTR)
+            continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return KIVFS_EAGAIN;
+        return KIVFS_EIO;
+    }
+}
+
+long kivfs_sock_writev_some(int fd, const struct iovec *iov, int iovcnt)
+{
+    if (iovcnt < 1 || iovcnt > KIVFS_SOCK_MAX_IOV) {
+        errno = EINVAL;
+        return KIVFS_EIO;
+    }
+    struct msghdr msg;
+    memset(&msg, 0, sizeof msg);
+    msg.msg_iov    = (struct iovec *)iov;   /* sendmsg iovec nemění */
+    msg.msg_iovlen = (size_t)iovcnt;
+    for (;;) {
+        ssize_t n = sendmsg(fd, &msg, SEND_FLAGS);
         if (n >= 0)
             return (long)n;
         if (errno == EINTR)

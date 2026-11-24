@@ -95,7 +95,7 @@ struct server {
     pthread_mutex_t lock;
     int             accepts;
     int             packets;
-    int             closes[KIVFS_CLOSE_SHUTDOWN + 1];
+    int             closes[KIVFS_CLOSE_RESP_TIMEOUT + 1];
     kivfs_conn_id   last_accept_id;
     kivfs_conn_id   last_close_id;
 
@@ -136,10 +136,12 @@ static void cb_packet(void *user, kivfs_conn_id id, struct kivfs_packet *pkt)
     }
 }
 
-static void cb_close(void *user, kivfs_conn_id id, enum kivfs_close_reason reason, int err)
+static void cb_close(void *user, kivfs_conn_id id, int outgoing,
+                     enum kivfs_close_reason reason, int err)
 {
     struct server *s = user;
     (void)err;
+    (void)outgoing;
     pthread_mutex_lock(&s->lock);
     s->closes[reason]++;
     s->last_close_id = id;

@@ -87,6 +87,23 @@
  * na kterém ještě neproběhlo HELLO. Skutečné uzly mají ID >= 1. */
 #define KIVFS_NODE_ID_UNKNOWN   0u
 
+/* Verze protokolu posílaná v HELLO; strany s různou verzí se odmítnou.
+ * Zvýšit při každé nekompatibilní změně formátu. */
+#define KIVFS_PROTO_VERSION     1u
+
+/* Druh protistrany – serverové moduly (kap. 7.1) a CLI klient.
+ * Bude se posílat v HELLO, proto patří k protokolu; hodnoty se nesmí měnit.
+ * Textové názvy (= názvy sekcí konfigurace) vrací kivfs_module_name. */
+enum kivfs_module {
+    KIVFS_MOD_CLIENT = 0,
+    KIVFS_MOD_AUTH   = 1,
+    KIVFS_MOD_SYNC   = 2,
+    KIVFS_MOD_VFS    = 3,
+    KIVFS_MOD_DB     = 4,
+    KIVFS_MOD_FS     = 5,
+    KIVFS_MOD_COUNT
+};
+
 /* ------------------------------------------------------------------ */
 /* Kódy požadavků – musí být < KIVFS_RESPONSE_FLAG                     */
 /* U každého kódu popiš pořadí záznamů v požadavku i v odpovědi.       */
@@ -95,10 +112,14 @@
 enum kivfs_request_code {
     /*
      * HELLO – první paket na každém novém spojení (handshake).
-     * Strana, která se připojila, se představí; druhá strana odpoví svým ID.
-     * Teprve potom smí po spojení jít cokoli jiného.
-     *   požadavek: [u32 node_id]            (CLI klient posílá KIVFS_NODE_ID_UNKNOWN)
-     *   odpověď:   [u64 req_ts][u32 node_id]
+     * Strana, která se připojila, se představí; druhá strana odpoví tím
+     * samým za sebe. Teprve potom smí po spojení jít cokoli jiného.
+     *   požadavek: [u32 node_id][u32 module][u32 proto_version]
+     *              [u64 incarnation][u32 cluster_hash]
+     *   odpověď:   [u64 req_ts] + stejných 5 polí za odpovídající stranu
+     * CLI klient: node_id = KIVFS_NODE_ID_UNKNOWN, module = KIVFS_MOD_CLIENT,
+     * cluster_hash = 0. Kdo se smí s kým spojit a co se kontroluje: hello.h.
+     * Chybové stavy: MALFORMED, REJECTED (odpovídající pak spojení zavře).
      */
     KIVFS_REQ_HELLO = 1,
 
@@ -111,6 +132,53 @@ enum kivfs_request_code {
      * CLI klient posílá jeden záznam [u32 seq] a kontroluje, že se vrátil.
      */
     KIVFS_REQ_PING = 2,
+
+    /*
+     * STATUS – diagnostika propojení (kivfs-check). Kaskáda: modul připojí
+     * svůj blok a zeptá se modulů, které volá (Auth -> Sync -> VFS -> DB, FS);
+     * jejich bloky připojí za svůj. Synce ostatních uzlů se neptá.
+     *   požadavek: prázdný
+     *   odpověď:   [u64 req_ts] + 1..N bloků modulů, formát bloku: status.h
+     * Modul, který neodpověděl (linka dole, timeout), v odpovědi chybí.
+     */
+    KIVFS_REQ_STATUS = 3,
+
+    /* ---------------------------------------------------------------
+     * Operace klienta (10–99): klient -> Auth -> Sync -> VFS.
+     * Klient posílá záznamy níže; Auth před ně vloží [ctx] (fsproto.h)
+     * a se STEJNÝM kódem pošle dál, Sync přepošle beze změny, VFS ho
+     * zpracuje. Odpověď putuje zpět (každý hop přebalí kvůli ref).
+     * Pevné struktury (attr, ctx, entry) = jeden binární záznam, viz
+     * fsproto.h. path = absolutní cesta (pravidla: kivfs_path_check).
+     * --------------------------------------------------------------- */
+
+    /* STAT  req [path]            resp [ref][attr] */
+    KIVFS_REQ_STAT  = 10,
+    /* MKDIR req [path][u32 mode]  resp [ref]        mode = jen práva (07777) */
+    KIVFS_REQ_MKDIR = 11,
+    /* LIST  req [path]            resp [ref][entry]...  (všechny položky,
+     *                             seřazené podle jména; bez stránkování –
+     *                             adresář nad KIVFS_MAX_PAYLOAD -> INTERNAL) */
+    KIVFS_REQ_LIST  = 12,
+    /* RMDIR req [path]            resp [ref]        adresář musí být prázdný */
+    KIVFS_REQ_RMDIR = 13,
+
+    /* ---------------------------------------------------------------
+     * Interní operace DB (100–199): VFS -> DB. DB je úložiště, práva
+     * nekontroluje (dělá to VFS); kontroluje jen konzistenci stromu.
+     * --------------------------------------------------------------- */
+
+    /* DB_GET    req [path]                          resp [ref][attr] */
+    KIVFS_REQ_DB_GET    = 100,
+    /* DB_MKNODE req [path][mknode]                  resp [ref][attr]
+     *           mknode = u32 mode | u32 uid | u32 gid (jeden záznam, 12 B),
+     *           mode včetně typu (KIVFS_MODE_DIR | práva) */
+    KIVFS_REQ_DB_MKNODE = 101,
+    /* DB_LIST   req [path]                          resp [ref][entry]... */
+    KIVFS_REQ_DB_LIST   = 102,
+    /* DB_RMNODE req [path]                          resp [ref]
+     *           adresář musí být prázdný (NOT_EMPTY), "/" nejde (ACCESS_DENIED) */
+    KIVFS_REQ_DB_RMNODE = 103,
 
     /* ... další kódy doplnit podle specifikace ... */
 };
@@ -128,14 +196,25 @@ enum kivfs_status {
     KIVFS_STATUS_EXISTS        = -4,   /* soubor/adresář už existuje */
     KIVFS_STATUS_ACCESS_DENIED = -5,   /* nedostatečná práva */
     KIVFS_STATUS_BUSY          = -6,   /* dočasně nelze (zámek apod.), zkus znovu */
-    KIVFS_STATUS_INTERNAL      = -7    /* chyba na straně odpovídajícího
+    KIVFS_STATUS_INTERNAL      = -7,   /* chyba na straně odpovídajícího
                                         * (DB, disk...); detail jen v jeho logu */
+    KIVFS_STATUS_REJECTED      = -8,   /* HELLO odmítnuto (nesedí verze, cluster,
+                                        * nebo protistrana se nesmí připojit);
+                                        * odpovídající pak spojení zavře */
+    KIVFS_STATUS_UNAVAILABLE   = -9,   /* chybí závislost (např. VFS nemá DB),
+                                        * zkus později */
+    KIVFS_STATUS_NOT_DIR       = -10,  /* složka cesty (nebo cíl) není adresář */
+    KIVFS_STATUS_NOT_EMPTY     = -11   /* rmdir neprázdného adresáře */
 };
 
 /* Vrátí statický název stavu pro výpisy a logy ("OK", "BUSY", ...).
  * Obdoba kivfs_strerror, ale pro stavy NA DRÁTĚ. Hodnota přichází od
  * protistrany, takže může být libovolná: pro neznámou vrací "UNKNOWN_STATUS". */
 const char *kivfs_status_str(int16_t status);
+
+/* Název modulu ("auth", "sync", ...; "client") = název jeho sekce
+ * v konfiguraci. Hodnota může přijít od protistrany: neznámá -> "?". */
+const char *kivfs_module_name(uint32_t module);
 
 /* ------------------------------------------------------------------ */
 /* Request / response kódy                                             */

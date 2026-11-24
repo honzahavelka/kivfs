@@ -1,0 +1,44 @@
+# KIVFS – scénář "3 stroje, na každém všech 5 modulů" (conf/3nodes)
+#
+# Spuštění a kontrola propojení (z kořene projektu):
+#   docker compose -f docker/docker-compose.yml up --build \
+#       --abort-on-container-exit --exit-code-from check
+# Exit kód = výsledek kivfs-check (0 = 15 modulů a 18 spojení OK).
+#
+# Jen uzly (ruční zkoušení výpadků: docker compose stop node2 ...):
+#   docker compose -f docker/docker-compose.yml up --build -d node1 node2 node3
+#   docker compose -f docker/docker-compose.yml run --rm check
+
+x-node: &node
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.node
+  image: kivfs-node
+  networks: [kivfs]
+  stop_grace_period: 5s
+
+services:
+  node1:
+    <<: *node
+    hostname: node1
+    command: ["/kivfs/docker/start-node.sh", "/kivfs/conf/3nodes/node1.ini"]
+  node2:
+    <<: *node
+    hostname: node2
+    command: ["/kivfs/docker/start-node.sh", "/kivfs/conf/3nodes/node2.ini"]
+  node3:
+    <<: *node
+    hostname: node3
+    command: ["/kivfs/docker/start-node.sh", "/kivfs/conf/3nodes/node3.ini"]
+
+  check:
+    <<: *node
+    depends_on: [node1, node2, node3]
+    command: ["/kivfs/build/kivfs-check",
+              "-c", "/kivfs/conf/3nodes/node1.ini",
+              "-c", "/kivfs/conf/3nodes/node2.ini",
+              "-c", "/kivfs/conf/3nodes/node3.ini",
+              "--wait", "30"]
+
+networks:
+  kivfs: {}

@@ -21,10 +21,14 @@ const char *kivfs_strerror(int err)
     case KIVFS_EIO:         return "socket I/O error (see errno)";
     case KIVFS_ERESOLVE:    return "address resolution failed";
     case KIVFS_EUNEXPECTED: return "response does not match the request";
+    case KIVFS_ECONNLOST:   return "connection lost before response (result unknown)";
 
     /* fronta / server */
     case KIVFS_ESHUTDOWN:   return "component is shutting down";
     case KIVFS_EINVAL:      return "invalid argument";
+
+    /* konfigurace */
+    case KIVFS_ECONFIG:     return "invalid configuration";
     }
     return "unknown error";
 }

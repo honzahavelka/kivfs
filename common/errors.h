@@ -24,6 +24,7 @@
  *    -1 ..  -19   protocol / packet
  *   -20 ..  -39   socket / channel
  *   -40 ..  -59   fronta / server
+ *   -60 ..  -79   konfigurace
  *
  * Typické použití:
  *     int rc = kivfs_chan_call(&ch, &req, &resp);
@@ -70,12 +71,23 @@ enum kivfs_err {
                                * požadavku (jiný kód operace nebo jiný ref).
                                * Při "jeden požadavek na kanál" by se to nemělo
                                * stát – značí chybu v protistraně. */
+    KIVFS_ECONNLOST   = -27,  /* Odchozí požadavek: spojení zaniklo dřív, než
+                               * přišla odpověď. Výsledek je NEZNÁMÝ –
+                               * protistrana ho mohla provést. */
 
     /* ---- fronta / server ---- */
     KIVFS_ESHUTDOWN   = -40,  /* Komponenta (fronta, reactor) se ukončuje.
                                * Pro workera signál "skonči". */
-    KIVFS_EINVAL      = -41   /* Neplatný argument funkce (např. nulová
+    KIVFS_EINVAL      = -41,  /* Neplatný argument funkce (např. nulová
                                * kapacita fronty) – chyba volajícího. */
+    KIVFS_ENOTREADY   = -42,  /* Modul, který chci volat, teď není
+                               * připojený (linka dole) – odpovědět
+                               * protistraně KIVFS_STATUS_UNAVAILABLE. */
+
+    /* ---- konfigurace ---- */
+    KIVFS_ECONFIG     = -60   /* Chybná konfigurace (syntaxe, chybějící nebo
+                               * neznámý klíč, neplatná hodnota). Přesný důvod
+                               * "soubor:řádek: ..." je v err bufferu volajícího. */
 };
 
 /* Vrátí statický textový popis chyby pro logy (řetězec se neuvolňuje).

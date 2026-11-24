@@ -55,6 +55,21 @@ const char *kivfs_status_str(int16_t status)
     case KIVFS_STATUS_ACCESS_DENIED: return "ACCESS_DENIED";
     case KIVFS_STATUS_BUSY:          return "BUSY";
     case KIVFS_STATUS_INTERNAL:      return "INTERNAL";
+    case KIVFS_STATUS_REJECTED:      return "REJECTED";
+    case KIVFS_STATUS_UNAVAILABLE:   return "UNAVAILABLE";
     }
     return "UNKNOWN_STATUS";
+}
+
+const char *kivfs_module_name(uint32_t module)
+{
+    switch (module) {
+    case KIVFS_MOD_CLIENT: return "client";
+    case KIVFS_MOD_AUTH:   return "auth";
+    case KIVFS_MOD_SYNC:   return "sync";
+    case KIVFS_MOD_VFS:    return "vfs";
+    case KIVFS_MOD_DB:     return "db";
+    case KIVFS_MOD_FS:     return "fs";
+    default:               return "?";
+    }
 }

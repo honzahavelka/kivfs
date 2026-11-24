@@ -13,7 +13,7 @@
  * Používají ji dva odlišné světy:
  *   BLOKUJÍCÍ (channel.h, odchozí spojení): volání čeká, dokud nepřenese vše
  *     nebo nevyprší timeout. Jednoduchý lineární kód.
- *   NEBLOKUJÍCÍ (epoll reactor, příchozí spojení): volání nikdy nečeká;
+ *   NEBLOKUJÍCÍ (epoll reactor, příchozí i odchozí spojení): volání nikdy nečeká;
  *     když teď nejde nic přenést, vrátí KIVFS_EAGAIN a reactor to zkusí,
  *     až epoll ohlásí, že socket je připravený.
  *
@@ -31,6 +31,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h> /* struct sockaddr, socklen_t */
 #include <sys/uio.h>   /* struct iovec */
 
 /* Dost místa pro "ip:port" včetně nejdelší IPv6 adresy (46 znaků) + port. */
@@ -77,6 +78,25 @@ int  kivfs_sock_accept(int listen_fd, char *peer_addr, size_t peer_addr_size);
  *   - výsledný fd je BLOKUJÍCÍ (pro channel) a má TCP_NODELAY
  * Vrací fd (>= 0), KIVFS_ERESOLVE, KIVFS_ETIMEOUT nebo KIVFS_EIO. */
 int  kivfs_sock_connect(const char *host, uint16_t port, int timeout_ms);
+
+/* Přeloží host:port na PRVNÍ adresu, kterou vrátí getaddrinfo.
+ * BLOKUJE (DNS) – nevolat v I/O vlákně reactoru. Výsledek se předává
+ * do kivfs_reactor_connect / kivfs_ev_connect.
+ * Vrací KIVFS_OK nebo KIVFS_ERESOLVE. */
+int  kivfs_sock_resolve(const char *host, uint16_t port,
+                        struct sockaddr_storage *out, socklen_t *out_len);
+
+/* NEBLOKUJÍCÍ odchozí spojení pro reactor: vytvoří neblokující socket
+ * (TCP_NODELAY) a zahájí connect. Výsledek navazování se pozná až ve
+ * chvíli, kdy epoll ohlásí socket jako zapisovatelný (EPOLLOUT) nebo
+ * chybu – pak zavolat kivfs_sock_connect_finish.
+ * Vrací fd (>= 0) nebo KIVFS_EIO (connect selhal hned, např. ENETUNREACH;
+ * errno zachováno). */
+int  kivfs_sock_connect_start(const struct sockaddr *addr, socklen_t addrlen);
+
+/* Zjistí, jak dopadl neblokující connect (SO_ERROR).
+ * KIVFS_OK = navázáno, jinak KIVFS_EIO a errno = příčina (ECONNREFUSED...). */
+int  kivfs_sock_connect_finish(int fd);
 
 /* Zavře *fd a nastaví *fd = -1; pro *fd < 0 nic nedělá.
  * Díky nastavení na -1 je bezpečné volat ji opakovaně (žádný dvojitý close,
@@ -138,5 +158,10 @@ int  kivfs_sock_writev_full(int fd, const struct iovec *iov, int iovcnt);
  * Kde v paketu se právě nacházíme, si pamatuje reactor, ne tato funkce. */
 long kivfs_sock_read_some (int fd, void *buf, size_t len);
 long kivfs_sock_write_some(int fd, const void *buf, size_t len);
+
+/* Jako write_some, ale z více bufferů najednou (sendmsg) – reactor tak
+ * pošle hlavičku a payload jedním voláním a typicky jedním TCP segmentem.
+ * iovcnt 1..KIVFS_SOCK_MAX_IOV. Návratové hodnoty jako write_some. */
+long kivfs_sock_writev_some(int fd, const struct iovec *iov, int iovcnt);
 
 #endif /* KIVFS_SOCKET_H */

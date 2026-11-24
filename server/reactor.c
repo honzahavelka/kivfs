@@ -4,12 +4,24 @@
  *
  * Vnitřní uspořádání:
  *
- *   conns[max_conns]   tabulka slotů spojení. Sahá na ni JEN I/O vlákno.
- *   free_stack         volné indexy slotů (zásobník -> O(1) alokace).
- *   mailbox            jednosměrný seznam zpráv od workerů (SEND / CLOSE),
- *                      chráněný mutexem; I/O vlákno ho celý "ukradne"
- *                      (prohození hlavy) a zpracuje bez zámku.
+ *   conns[total]       tabulka slotů spojení. Sahá na ni JEN I/O vlákno.
+ *                      Sloty 0..max_conns-1 jsou příchozí, max_conns..total-1
+ *                      odchozí (oddělené limity, viz reactor.h).
+ *   in_free            volné příchozí sloty (zásobník, jen I/O vlákno).
+ *   out_free           volné odchozí sloty (zásobník pod mb_lock):
+ *                      kivfs_reactor_connect si slot rezervuje v cizím
+ *                      vlákně, aby mohl conn_id vrátit hned.
+ *   mailbox            jednosměrný seznam zpráv od workerů (SEND / CLOSE /
+ *                      CONNECT / REQUEST / TIMER), chráněný mutexem;
+ *                      I/O vlákno ho celý "ukradne" a zpracuje bez zámku.
+ *   timers             seřazený seznam časovačů (podle deadline). Uzel =
+ *                      zpráva z mailboxu, takže se v I/O vlákně nealokuje.
+ *                      Vkládání O(n) – časovačů jsou stovky, ne miliony.
  *   wake_fd            eventfd v epollu; zápis do něj probudí epoll_wait.
+ *
+ * Odchozí spojení: požadavky čekají v pend (FIFO). Jeden je "cur" – zapisuje
+ * se nebo čeká na odpověď; jeho tag/timestamp/kód/deadline jsou v conn,
+ * protože samotná zpráva se po zápisu uvolní jako u odpovědí.
  *
  * Jedna struktura struct out_msg slouží jako zpráva v mailboxu i jako
  * položka fronty k odeslání daného spojení – I/O vlákno ji jen přepojí,
@@ -35,6 +47,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -46,6 +59,11 @@
  * čekající spojení pořád dokola a smyčka by se točila na 100 % CPU. */
 #define ACCEPT_BACKOFF_MS        100
 
+/* Výchozí hodnoty konfigurace (0 v kivfs_reactor_config). */
+#define DEFAULT_MAX_OUT_CONNS       64
+#define DEFAULT_MAX_PENDING         16
+#define DEFAULT_CONNECT_TIMEOUT_MS  5000
+
 #define TOKEN_LISTEN             ((uint64_t)1)   /* generace 0, slot 1 */
 #define TOKEN_WAKE               ((uint64_t)2)   /* generace 0, slot 2 */
 
@@ -55,16 +73,22 @@
 /* Struktury                                                           */
 /* ------------------------------------------------------------------ */
 
-enum msg_kind { MSG_SEND, MSG_CLOSE };
+enum msg_kind { MSG_SEND, MSG_CLOSE, MSG_CONNECT, MSG_REQUEST, MSG_TIMER };
 
 struct out_msg {
     struct out_msg     *next;
     enum msg_kind       kind;
     kivfs_conn_id       id;
-    /* jen MSG_SEND: */
+    /* MSG_SEND, MSG_REQUEST: */
     uint8_t             hdr[KIVFS_HEADER_WIRE_SIZE];  /* zakódovaná hlavička */
     struct kivfs_packet pkt;
     size_t              off;      /* kolik bajtů (hlavička + payload) už odešlo */
+    /* MSG_REQUEST, MSG_TIMER: */
+    uint64_t            tag;
+    long long           deadline_ms;
+    /* MSG_CONNECT: */
+    struct sockaddr_storage addr;
+    socklen_t           addrlen;
 };
 
 struct conn {
@@ -73,6 +97,8 @@ struct conn {
     uint8_t   active;
     uint8_t   awaiting;           /* doručen požadavek, čeká se na odpověď */
     uint8_t   closing;            /* close_conn: zavřít po odeslání fronty */
+    uint8_t   outgoing;           /* založeno přes kivfs_reactor_connect */
+    uint8_t   connecting;         /* odchozí: connect ještě neskončil */
     uint32_t  ev_mask;            /* události aktuálně registrované v epollu */
 
     /* příjem rozpracovaného paketu */
@@ -84,6 +110,16 @@ struct conn {
 
     /* fronta k odeslání */
     struct out_msg *tx_head, *tx_tail;
+
+    /* jen odchozí spojení */
+    long long       connect_deadline_ms;
+    struct out_msg *pend_head, *pend_tail;  /* požadavky čekající na odeslání */
+    uint32_t        pend_count;
+    uint8_t         cur_active;   /* požadavek se zapisuje / čeká na odpověď */
+    uint16_t        cur_code;
+    uint64_t        cur_ts;       /* header.timestamp = očekávaný ref */
+    uint64_t        cur_tag;
+    long long       cur_deadline_ms;
 };
 
 struct kivfs_reactor {
@@ -95,9 +131,15 @@ struct kivfs_reactor {
     int wake_fd;
 
     struct conn *conns;
-    uint32_t    *free_stack;
-    uint32_t     free_top;        /* počet volných slotů */
+    uint32_t     total;           /* max_conns + max_out_conns */
+    uint32_t    *in_free;
+    uint32_t     in_free_top;     /* počet volných příchozích slotů */
+    uint32_t    *out_free;        /* pod mb_lock */
+    uint32_t     out_free_top;
+    uint32_t     out_live;        /* aktivní odchozí spojení (I/O vlákno) */
     uint32_t     rx_inflight;     /* spojení s rozpracovaným paketem */
+
+    struct out_msg *timers;       /* seřazeno podle deadline_ms */
 
     int          listen_paused;
     long long    listen_resume_ms;
@@ -136,7 +178,7 @@ static struct conn *conn_lookup(struct kivfs_reactor *r, kivfs_conn_id id)
 {
     uint32_t idx = (uint32_t)id;
     uint32_t gen = (uint32_t)(id >> 32);
-    if (gen == 0 || idx >= r->cfg.max_conns)
+    if (gen == 0 || idx >= r->total)
         return NULL;
     struct conn *c = &r->conns[idx];
     return (c->active && c->gen == gen) ? c : NULL;
@@ -172,9 +214,18 @@ static void wake(struct kivfs_reactor *r)
 /* Spojení: registrace v epollu a zavření                              */
 /* ------------------------------------------------------------------ */
 
+/* Příchozí: čte se, jen když neběží požadavek. Odchozí: čte se vždy
+ * (chodí jen odpovědi; nevyžádaná odpověď = porušení protokolu). */
 static int reading_enabled(const struct conn *c)
 {
-    return !c->awaiting && !c->closing;
+    if (c->connecting || c->closing)
+        return 0;
+    return c->outgoing || !c->awaiting;
+}
+
+static void resp_fail(struct kivfs_reactor *r, kivfs_conn_id id, uint64_t tag, int err)
+{
+    r->cb.on_response(r->cb.user, id, tag, err, NULL);
 }
 
 static void conn_close(struct kivfs_reactor *r, struct conn *c,
@@ -189,10 +240,14 @@ static void conn_close(struct kivfs_reactor *r, struct conn *c,
 static int conn_update_events(struct kivfs_reactor *r, struct conn *c)
 {
     uint32_t want = 0;
-    if (reading_enabled(c))
-        want |= EPOLLIN;
-    if (c->tx_head != NULL)
-        want |= EPOLLOUT;
+    if (c->connecting)
+        want = EPOLLOUT;          /* konec connect = socket zapisovatelný */
+    else {
+        if (reading_enabled(c))
+            want |= EPOLLIN;
+        if (c->tx_head != NULL)
+            want |= EPOLLOUT;
+    }
     if (want == c->ev_mask)
         return 1;
 
@@ -213,6 +268,7 @@ static void conn_close(struct kivfs_reactor *r, struct conn *c,
 {
     kivfs_conn_id id = conn_id_of(r, c);
     uint32_t idx = (uint32_t)(c - r->conns);
+    int out = c->outgoing;
 
     /* close() fd zároveň odebere z epollu (nemáme žádné dup kopie fd). */
     kivfs_sock_close(&c->fd);
@@ -222,24 +278,57 @@ static void conn_close(struct kivfs_reactor *r, struct conn *c,
     kivfs_pkt_free(&c->rx);
     msg_list_free(c->tx_head);
 
-    c->active   = 0;
-    c->awaiting = 0;
-    c->closing  = 0;
-    c->ev_mask  = 0;
-    c->hdr_got  = 0;
-    c->data_got = 0;
-    c->tx_head  = c->tx_tail = NULL;
+    struct out_msg *pend = c->pend_head;
+    int      had_cur = c->cur_active;
+    uint64_t cur_tag = c->cur_tag;
+
+    c->active     = 0;
+    c->awaiting   = 0;
+    c->closing    = 0;
+    c->outgoing   = 0;
+    c->connecting = 0;
+    c->ev_mask    = 0;
+    c->hdr_got    = 0;
+    c->data_got   = 0;
+    c->tx_head    = c->tx_tail = NULL;
+    c->pend_head  = c->pend_tail = NULL;
+    c->pend_count = 0;
+    c->cur_active = 0;
+
+    /* Odchozí: každý přijatý požadavek musí dostat právě jeden on_response,
+     * a to DŘÍV než on_close (on_close je poslední událost spojení). */
+    if (out) {
+        int rerr = reason == KIVFS_CLOSE_SHUTDOWN ? KIVFS_ESHUTDOWN : KIVFS_ECONNLOST;
+        if (had_cur)
+            resp_fail(r, id, cur_tag, rerr);
+        while (pend != NULL) {
+            struct out_msg *next = pend->next;
+            resp_fail(r, id, pend->tag, rerr);
+            msg_free(pend);
+            pend = next;
+        }
+        r->out_live--;
+    }
 
     /* Callback dostane ještě staré id; pokud v něm (nebo kdykoli později)
      * někdo pošle na toto id, zpráva v mailboxu narazí na novou generaci
      * a zahodí se. */
     if (r->cb.on_close != NULL)
-        r->cb.on_close(r->cb.user, id, reason, err);
+        r->cb.on_close(r->cb.user, id, out, reason, err);
 
     c->gen++;
     if (c->gen == 0)        /* přetečení: 0 je rezervovaná */
         c->gen = 1;
-    r->free_stack[r->free_top++] = idx;
+
+    if (out) {
+        /* gen++ proběhl před uvolněním zámku -> kivfs_reactor_connect,
+         * který slot vezme, uvidí už novou generaci */
+        pthread_mutex_lock(&r->mb_lock);
+        r->out_free[r->out_free_top++] = idx;
+        pthread_mutex_unlock(&r->mb_lock);
+    } else {
+        r->in_free[r->in_free_top++] = idx;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -252,15 +341,26 @@ static int conn_flush(struct kivfs_reactor *r, struct conn *c)
     while (c->tx_head != NULL) {
         struct out_msg *m = c->tx_head;
         size_t total = KIVFS_HEADER_WIRE_SIZE + (size_t)m->pkt.header.data_size;
-        long n;
+        struct iovec iov[2];
+        int cnt = 0;
 
-        if (m->off < KIVFS_HEADER_WIRE_SIZE)
-            n = kivfs_sock_write_some(c->fd, m->hdr + m->off,
-                                      KIVFS_HEADER_WIRE_SIZE - m->off);
-        else
-            n = kivfs_sock_write_some(c->fd,
-                                      m->pkt.data + (m->off - KIVFS_HEADER_WIRE_SIZE),
-                                      total - m->off);
+        /* Hlavička i payload jedním voláním (writev) – malý paket tak
+         * odejde v jednom TCP segmentu. */
+        if (m->off < KIVFS_HEADER_WIRE_SIZE) {
+            iov[cnt].iov_base = m->hdr + m->off;
+            iov[cnt].iov_len  = KIVFS_HEADER_WIRE_SIZE - m->off;
+            cnt++;
+            if (m->pkt.header.data_size > 0) {
+                iov[cnt].iov_base = m->pkt.data;
+                iov[cnt].iov_len  = m->pkt.header.data_size;
+                cnt++;
+            }
+        } else {
+            iov[cnt].iov_base = m->pkt.data + (m->off - KIVFS_HEADER_WIRE_SIZE);
+            iov[cnt].iov_len  = total - m->off;
+            cnt++;
+        }
+        long n = kivfs_sock_writev_some(c->fd, iov, cnt);
 
         if (n == KIVFS_EAGAIN)
             break;                              /* počkat na EPOLLOUT */
@@ -276,7 +376,7 @@ static int conn_flush(struct kivfs_reactor *r, struct conn *c)
         /* Celý paket je v jádře. Odpověď uvolní spojení pro další
          * požadavek – až teď, ne už při zařazení: peer, který posílá
          * požadavky a nečte odpovědi, tak nenafoukne naši frontu. */
-        if (kivfs_proto_is_response(m->pkt.header.request_code))
+        if (!c->outgoing && kivfs_proto_is_response(m->pkt.header.request_code))
             c->awaiting = 0;
 
         c->tx_head = m->next;
@@ -292,6 +392,34 @@ static int conn_flush(struct kivfs_reactor *r, struct conn *c)
     return conn_update_events(r, c);
 }
 
+/* Odchozí spojení: pokud je volné (navázané, nic neběží), začne odesílat
+ * další čekající požadavek. Vrací 1 = spojení žije, 0 = zavřeno. */
+static int out_start_next(struct kivfs_reactor *r, struct conn *c)
+{
+    if (c->connecting || c->cur_active || c->pend_head == NULL)
+        return 1;
+
+    struct out_msg *m = c->pend_head;
+    c->pend_head = m->next;
+    if (c->pend_head == NULL)
+        c->pend_tail = NULL;
+    c->pend_count--;
+
+    c->cur_active      = 1;
+    c->cur_code        = m->pkt.header.request_code;
+    c->cur_ts          = m->pkt.header.timestamp;
+    c->cur_tag         = m->tag;
+    c->cur_deadline_ms = m->deadline_ms;
+
+    m->next = NULL;
+    if (c->tx_head == NULL)
+        c->tx_head = m;
+    else
+        c->tx_tail->next = m;
+    c->tx_tail = m;
+    return conn_flush(r, c);
+}
+
 /* ------------------------------------------------------------------ */
 /* Příjem                                                              */
 /* ------------------------------------------------------------------ */
@@ -304,6 +432,30 @@ static void conn_deliver(struct kivfs_reactor *r, struct conn *c)
     c->hdr_got  = 0;
     c->data_got = 0;
     r->rx_inflight--;
+
+    uint16_t code = pkt.header.request_code;
+
+    if (c->outgoing) {
+        /* Musí to být odpověď právě na rozpracovaný požadavek. */
+        uint64_t ref;
+        if (!c->cur_active || code != (uint16_t)(c->cur_code | KIVFS_RESPONSE_FLAG)
+            || kivfs_pkt_response_ref(&pkt, &ref) != KIVFS_OK || ref != c->cur_ts) {
+            kivfs_pkt_free(&pkt);
+            conn_close(r, c, KIVFS_CLOSE_PROTOCOL, 0);
+            return;
+        }
+        uint64_t tag = c->cur_tag;
+        c->cur_active = 0;
+        r->cb.on_response(r->cb.user, conn_id_of(r, c), tag, KIVFS_OK, &pkt);
+        out_start_next(r, c);
+        return;
+    }
+
+    if (kivfs_proto_is_response(code)) {      /* odpověď na příchozím spojení */
+        kivfs_pkt_free(&pkt);
+        conn_close(r, c, KIVFS_CLOSE_PROTOCOL, 0);
+        return;
+    }
     c->awaiting = 1;
 
     if (!conn_update_events(r, c)) {          /* EPOLLIN pryč */
@@ -390,8 +542,35 @@ static void conn_on_readable(struct kivfs_reactor *r, struct conn *c)
 /* Události jednoho spojení                                            */
 /* ------------------------------------------------------------------ */
 
+/* Odchozí spojení: neblokující connect skončil (úspěchem i neúspěchem). */
+static void conn_on_connected(struct kivfs_reactor *r, struct conn *c, uint32_t events)
+{
+    int rc  = kivfs_sock_connect_finish(c->fd);
+    int err = errno;
+    if (rc == KIVFS_OK && (events & (EPOLLERR | EPOLLHUP))) {
+        rc  = KIVFS_EIO;
+        err = ECONNREFUSED;
+    }
+    if (rc != KIVFS_OK) {
+        conn_close(r, c, KIVFS_CLOSE_CONNECT, err);
+        return;
+    }
+    c->connecting = 0;
+    if (r->cb.on_connect != NULL)
+        r->cb.on_connect(r->cb.user, conn_id_of(r, c));
+    if (!conn_update_events(r, c))
+        return;
+    out_start_next(r, c);
+}
+
 static void conn_on_event(struct kivfs_reactor *r, struct conn *c, uint32_t events)
 {
+    if (c->connecting) {
+        if (events & (EPOLLOUT | EPOLLERR | EPOLLHUP))
+            conn_on_connected(r, c, events);
+        return;
+    }
+
     if (events & EPOLLERR) {
         int err = 0;
         socklen_t len = sizeof err;
@@ -458,19 +637,21 @@ static void on_accept_ready(struct kivfs_reactor *r)
             return;
         }
 
-        if (r->free_top == 0) {
+        if (r->in_free_top == 0) {
             LOG("odmítnuto spojení z %s: dosažen max_conns (%u)\n",
                 peer, r->cfg.max_conns);
             kivfs_sock_close(&fd);
             continue;
         }
 
-        uint32_t idx = r->free_stack[--r->free_top];
+        uint32_t idx = r->in_free[--r->in_free_top];
         struct conn *c = &r->conns[idx];
         c->fd       = fd;
         c->active   = 1;
         c->awaiting = 0;
         c->closing  = 0;
+        c->outgoing = 0;
+        c->connecting = 0;
         c->hdr_got  = 0;
         c->data_got = 0;
         c->tx_head  = c->tx_tail = NULL;
@@ -484,7 +665,7 @@ static void on_accept_ready(struct kivfs_reactor *r)
             LOG("epoll_ctl ADD (%s): %s\n", peer, strerror(errno));
             kivfs_sock_close(&c->fd);
             c->active = 0;
-            r->free_stack[r->free_top++] = idx;
+            r->in_free[r->in_free_top++] = idx;
             continue;
         }
         c->ev_mask = EPOLLIN;
@@ -497,6 +678,85 @@ static void on_accept_ready(struct kivfs_reactor *r)
 /* ------------------------------------------------------------------ */
 /* Mailbox                                                             */
 /* ------------------------------------------------------------------ */
+
+/* Zařadí časovač do seznamu seřazeného podle deadline (stejné deadline
+ * v pořadí zařazení). */
+static void timer_insert(struct kivfs_reactor *r, struct out_msg *m)
+{
+    struct out_msg **pp = &r->timers;
+    while (*pp != NULL && (*pp)->deadline_ms <= m->deadline_ms)
+        pp = &(*pp)->next;
+    m->next = *pp;
+    *pp = m;
+}
+
+/* MSG_CONNECT: slot už je rezervovaný (kivfs_reactor_connect). */
+static void out_connect(struct kivfs_reactor *r, struct out_msg *m)
+{
+    uint32_t idx = (uint32_t)m->id;
+    struct conn *c = &r->conns[idx];
+
+    c->fd         = -1;
+    c->active     = 1;
+    c->outgoing   = 1;
+    c->connecting = 1;
+    c->awaiting   = 0;
+    c->closing    = 0;
+    c->ev_mask    = 0;
+    c->hdr_got    = 0;
+    c->data_got   = 0;
+    c->tx_head    = c->tx_tail = NULL;
+    c->pend_head  = c->pend_tail = NULL;
+    c->pend_count = 0;
+    c->cur_active = 0;
+    memset(&c->rx, 0, sizeof c->rx);
+    r->out_live++;
+
+    int fd = kivfs_sock_connect_start((const struct sockaddr *)&m->addr, m->addrlen);
+    msg_free(m);
+    if (fd < 0) {
+        conn_close(r, c, KIVFS_CLOSE_CONNECT, errno);
+        return;
+    }
+    c->fd = fd;
+
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events   = EPOLLOUT;
+    ev.data.u64 = conn_id_of(r, c);
+    if (epoll_ctl(r->epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        conn_close(r, c, KIVFS_CLOSE_CONNECT, errno);
+        return;
+    }
+    c->ev_mask = EPOLLOUT;
+    c->connect_deadline_ms = now_ms() + r->cfg.connect_timeout_ms;
+}
+
+/* MSG_REQUEST: každá cesta končí buď zařazením, nebo on_response. */
+static void out_request(struct kivfs_reactor *r, struct conn *c, struct out_msg *m)
+{
+    int err = KIVFS_OK;
+    if (c == NULL || c->closing)
+        err = KIVFS_ECONNLOST;
+    else if (!c->outgoing)
+        err = KIVFS_EINVAL;
+    else if (c->pend_count + c->cur_active >= r->cfg.max_pending)
+        err = KIVFS_EAGAIN;
+
+    if (err != KIVFS_OK) {
+        resp_fail(r, m->id, m->tag, err);
+        msg_free(m);
+        return;
+    }
+
+    if (c->pend_tail == NULL)
+        c->pend_head = m;
+    else
+        c->pend_tail->next = m;
+    c->pend_tail = m;
+    c->pend_count++;
+    out_start_next(r, c);
+}
 
 /* Zpracuje zprávy od workerů. Vrací 1, pokud byl zavolán kivfs_reactor_stop.
  * stop je obyčejný int pod mb_lock (ne stdatomic): stop vždy budí přes
@@ -516,12 +776,33 @@ static int process_mailbox(struct kivfs_reactor *r)
 
     while (m != NULL) {
         struct out_msg *next = m->next;
-        struct conn *c = conn_lookup(r, m->id);
         m->next = NULL;
 
-        if (c == NULL || c->closing) {
+        if (m->kind == MSG_TIMER) {
+            timer_insert(r, m);
+            m = next;
+            continue;
+        }
+        if (m->kind == MSG_CONNECT) {
+            out_connect(r, m);
+            m = next;
+            continue;
+        }
+
+        struct conn *c = conn_lookup(r, m->id);
+
+        if (m->kind == MSG_REQUEST) {
+            out_request(r, c, m);
+        } else if (c == NULL || c->closing) {
             /* spojení zaniklo (nebo se zavírá) – tiše zahodit */
             msg_free(m);
+        } else if (m->kind == MSG_SEND && c->outgoing) {
+            /* odpověď na odchozí spojení nepatří – zahodit */
+            LOG("send na odchozí spojení %llx zahozen\n", (unsigned long long)m->id);
+            msg_free(m);
+        } else if (m->kind == MSG_CLOSE && c->outgoing) {
+            msg_free(m);
+            conn_close(r, c, KIVFS_CLOSE_LOCAL, 0);   /* odchozí: hned */
         } else if (m->kind == MSG_SEND) {
             int was_empty = (c->tx_head == NULL);
             if (was_empty)
@@ -592,10 +873,71 @@ static int run_timers(struct kivfs_reactor *r)
             next = r->listen_resume_ms;
     }
 
+#define NEXT(d) do { if (next < 0 || (d) < next) next = (d); } while (0)
+
+    /* časovače kivfs_reactor_timer */
+    while (r->timers != NULL && r->timers->deadline_ms <= now) {
+        struct out_msg *t = r->timers;
+        r->timers = t->next;
+        r->cb.on_timer(r->cb.user, t->tag);
+        msg_free(t);
+    }
+    if (r->timers != NULL)
+        NEXT(r->timers->deadline_ms);
+
+    /* odchozí spojení: connect timeout, timeouty požadavků */
+    for (uint32_t i = r->cfg.max_conns; i < r->total && r->out_live > 0; i++) {
+        struct conn *c = &r->conns[i];
+        if (!c->active || !c->outgoing)
+            continue;
+        kivfs_conn_id id = conn_id_of(r, c);
+
+        if (c->connecting) {
+            if (now >= c->connect_deadline_ms)
+                conn_close(r, c, KIVFS_CLOSE_CONNECT, ETIMEDOUT);
+            else
+                NEXT(c->connect_deadline_ms);
+            continue;
+        }
+
+        /* Čekající požadavek s prošlým časem se jen vyřadí. */
+        struct out_msg **pp = &c->pend_head;
+        struct out_msg *prev = NULL;
+        while (*pp != NULL) {
+            struct out_msg *m = *pp;
+            if (now >= m->deadline_ms) {
+                *pp = m->next;
+                if (c->pend_tail == m)
+                    c->pend_tail = prev;
+                c->pend_count--;
+                resp_fail(r, id, m->tag, KIVFS_ETIMEOUT);
+                msg_free(m);
+            } else {
+                NEXT(m->deadline_ms);
+                prev = m;
+                pp = &m->next;
+            }
+        }
+
+        /* Rozpracovaný požadavek: protistrana nic dalšího nepřečte, dokud
+         * neodpoví -> spojení je nepoužitelné, zavřít. */
+        if (c->cur_active) {
+            if (now >= c->cur_deadline_ms) {
+                uint64_t tag = c->cur_tag;
+                c->cur_active = 0;
+                resp_fail(r, id, tag, KIVFS_ETIMEOUT);
+                conn_close(r, c, KIVFS_CLOSE_RESP_TIMEOUT, ETIMEDOUT);
+            } else {
+                NEXT(c->cur_deadline_ms);
+            }
+        }
+    }
+#undef NEXT
+
     if (r->cfg.rx_timeout_ms > 0 && r->rx_inflight > 0) {
-        /* Lineární průchod: max_conns jsou stovky, ne miliony, a běží to
+        /* Lineární průchod: spojení jsou stovky, ne miliony, a běží to
          * jen když nějaký paket opravdu přichází. */
-        for (uint32_t i = 0; i < r->cfg.max_conns && r->rx_inflight > 0; i++) {
+        for (uint32_t i = 0; i < r->total && r->rx_inflight > 0; i++) {
             struct conn *c = &r->conns[i];
             if (!c->active || c->hdr_got == 0)
                 continue;
@@ -639,7 +981,8 @@ int kivfs_reactor_create(struct kivfs_reactor **out,
     *out = NULL;
     if (cfg == NULL || cb == NULL || cb->on_packet == NULL
         || cfg->max_conns == 0 || cfg->max_conns > 0x7FFFFFFFu
-        || cfg->rx_timeout_ms < 0)
+        || cfg->max_out_conns > 0x7FFFFFFFu - cfg->max_conns
+        || cfg->rx_timeout_ms < 0 || cfg->connect_timeout_ms < 0)
         return KIVFS_EINVAL;
 
     struct kivfs_reactor *r = calloc(1, sizeof *r);
@@ -648,6 +991,13 @@ int kivfs_reactor_create(struct kivfs_reactor **out,
 
     r->cfg = *cfg;
     r->cfg.bind_addr = NULL;     /* používá se jen tady; volající ho nemusí držet */
+    if (r->cfg.max_out_conns == 0)
+        r->cfg.max_out_conns = DEFAULT_MAX_OUT_CONNS;
+    if (r->cfg.max_pending == 0)
+        r->cfg.max_pending = DEFAULT_MAX_PENDING;
+    if (r->cfg.connect_timeout_ms == 0)
+        r->cfg.connect_timeout_ms = DEFAULT_CONNECT_TIMEOUT_MS;
+    r->total = r->cfg.max_conns + r->cfg.max_out_conns;
     r->cb  = *cb;
     r->listen_fd = r->epoll_fd = r->wake_fd = -1;
     r->mb_open = 1;
@@ -658,19 +1008,24 @@ int kivfs_reactor_create(struct kivfs_reactor **out,
         return KIVFS_ENOMEM;
     }
 
-    r->conns      = calloc(cfg->max_conns, sizeof *r->conns);
-    r->free_stack = calloc(cfg->max_conns, sizeof *r->free_stack);
-    if (r->conns == NULL || r->free_stack == NULL) {
+    r->conns    = calloc(r->total, sizeof *r->conns);
+    r->in_free  = calloc(r->cfg.max_conns, sizeof *r->in_free);
+    r->out_free = calloc(r->cfg.max_out_conns, sizeof *r->out_free);
+    if (r->conns == NULL || r->in_free == NULL || r->out_free == NULL) {
         rc = KIVFS_ENOMEM;
         goto fail;
     }
-    for (uint32_t i = 0; i < cfg->max_conns; i++) {
+    for (uint32_t i = 0; i < r->total; i++) {
         r->conns[i].fd  = -1;
         r->conns[i].gen = 1;
-        /* obráceně, aby se jako první vydal slot 0 (hezčí v logu) */
-        r->free_stack[i] = cfg->max_conns - 1 - i;
     }
-    r->free_top = cfg->max_conns;
+    /* obráceně, aby se jako první vydal nejnižší slot (hezčí v logu) */
+    for (uint32_t i = 0; i < r->cfg.max_conns; i++)
+        r->in_free[i] = r->cfg.max_conns - 1 - i;
+    r->in_free_top = r->cfg.max_conns;
+    for (uint32_t i = 0; i < r->cfg.max_out_conns; i++)
+        r->out_free[i] = r->total - 1 - i;
+    r->out_free_top = r->cfg.max_out_conns;
 
     rc = kivfs_sock_listen(cfg->bind_addr, cfg->port, cfg->backlog);
     if (rc < 0)
@@ -733,20 +1088,42 @@ int kivfs_reactor_run(struct kivfs_reactor *r)
     }
 
     /* ---- ukončení ---- */
-    /* 1) zavřít mailbox: další send vrátí KIVFS_EIO */
+    /* 1) zavřít mailbox: další send/request/connect/timer vrátí KIVFS_EIO */
     pthread_mutex_lock(&r->mb_lock);
     r->mb_open = 0;
     struct out_msg *pending = r->mb_head;
     r->mb_head = r->mb_tail = NULL;
     pthread_mutex_unlock(&r->mb_lock);
+
+    /* 2) nezpracované zprávy: i požadavky, které reactor ještě neviděl,
+     *    dostanou svůj on_response (ESHUTDOWN) a rezervovaná odchozí
+     *    spojení svůj on_close – nejdřív požadavky, pak spojení. */
+    for (struct out_msg *m = pending; m != NULL; m = m->next)
+        if (m->kind == MSG_REQUEST)
+            resp_fail(r, m->id, m->tag, KIVFS_ESHUTDOWN);
+    for (struct out_msg *m = pending; m != NULL; m = m->next) {
+        if (m->kind != MSG_CONNECT)
+            continue;
+        if (r->cb.on_close != NULL)
+            r->cb.on_close(r->cb.user, m->id, 1, KIVFS_CLOSE_SHUTDOWN, 0);
+        struct conn *c = &r->conns[(uint32_t)m->id];
+        c->gen++;
+        if (c->gen == 0)
+            c->gen = 1;
+    }
     msg_list_free(pending);
 
-    /* 2) zavřít všechna spojení; neodeslané odpovědi se zahodí */
-    for (uint32_t i = 0; i < r->cfg.max_conns; i++)
+    /* 3) zavřít všechna spojení; neodeslané odpovědi se zahodí, odchozí
+     *    požadavky dostanou ESHUTDOWN */
+    for (uint32_t i = 0; i < r->total; i++)
         if (r->conns[i].active)
             conn_close(r, &r->conns[i], KIVFS_CLOSE_SHUTDOWN, 0);
 
-    /* 3) přestat přijímat – noví klienti dostanou rovnou "connection refused"
+    /* 4) nevypršené časovače zahodit bez callbacku */
+    msg_list_free(r->timers);
+    r->timers = NULL;
+
+    /* 5) přestat přijímat – noví klienti dostanou rovnou "connection refused"
      *    místo visení v backlogu až do destroy */
     kivfs_sock_close(&r->listen_fd);
     return rc;
@@ -768,23 +1145,26 @@ void kivfs_reactor_destroy(struct kivfs_reactor *r)
         return;
 
     if (r->conns != NULL) {
-        for (uint32_t i = 0; i < r->cfg.max_conns; i++) {
+        for (uint32_t i = 0; i < r->total; i++) {
             struct conn *c = &r->conns[i];
             if (c->active) {           /* jen když run nikdy neběžel do konce */
                 kivfs_sock_close(&c->fd);
                 kivfs_pkt_free(&c->rx);
                 msg_list_free(c->tx_head);
+                msg_list_free(c->pend_head);
             }
         }
     }
     msg_list_free(r->mb_head);
+    msg_list_free(r->timers);
 
     kivfs_sock_close(&r->listen_fd);
     kivfs_sock_close(&r->epoll_fd);
     kivfs_sock_close(&r->wake_fd);
     pthread_mutex_destroy(&r->mb_lock);
     free(r->conns);
-    free(r->free_stack);
+    free(r->in_free);
+    free(r->out_free);
     free(r);
 }
 
@@ -833,4 +1213,90 @@ void kivfs_reactor_close_conn(struct kivfs_reactor *r, kivfs_conn_id id)
     m->kind = MSG_CLOSE;
     m->id   = id;
     (void)mailbox_post(r, m);       /* po skončení run už je stejně vše zavřené */
+}
+
+int kivfs_reactor_connect(struct kivfs_reactor *r,
+                          const struct sockaddr *addr, socklen_t addrlen,
+                          kivfs_conn_id *out)
+{
+    if (out != NULL)
+        *out = KIVFS_CONN_ID_INVALID;
+    if (r == NULL || addr == NULL || out == NULL
+        || addrlen == 0 || addrlen > sizeof(struct sockaddr_storage))
+        return KIVFS_EINVAL;
+
+    struct out_msg *m = calloc(1, sizeof *m);
+    if (m == NULL)
+        return KIVFS_ENOMEM;
+    m->kind = MSG_CONNECT;
+    memcpy(&m->addr, addr, addrlen);
+    m->addrlen = addrlen;
+
+    /* Slot se rezervuje a zpráva zařadí pod JEDNÍM zámkem: id se vrací
+     * hned a požadavky zařazené potom jsou v mailboxu až za CONNECT. */
+    pthread_mutex_lock(&r->mb_lock);
+    if (!r->mb_open || r->out_free_top == 0) {
+        int rc = r->mb_open ? KIVFS_EAGAIN : KIVFS_EIO;
+        pthread_mutex_unlock(&r->mb_lock);
+        free(m);
+        return rc;
+    }
+    uint32_t idx = r->out_free[--r->out_free_top];
+    kivfs_conn_id id = make_id(r->conns[idx].gen, idx);
+    m->id = id;
+    int need_wake = (r->mb_head == NULL);
+    if (r->mb_tail != NULL)
+        r->mb_tail->next = m;
+    else
+        r->mb_head = m;
+    r->mb_tail = m;
+    pthread_mutex_unlock(&r->mb_lock);
+
+    if (need_wake)
+        wake(r);
+    *out = id;      /* NE m->id: po odemčení může m I/O vlákno už uvolnit */
+    return KIVFS_OK;
+}
+
+int kivfs_reactor_request(struct kivfs_reactor *r, kivfs_conn_id id,
+                          struct kivfs_packet *req, uint64_t tag, int timeout_ms)
+{
+    if (req == NULL)
+        return KIVFS_EINVAL;
+    if (r == NULL || timeout_ms <= 0 || r->cb.on_response == NULL
+        || kivfs_proto_is_response(req->header.request_code)) {
+        kivfs_pkt_free(req);
+        return KIVFS_EINVAL;
+    }
+
+    struct out_msg *m = malloc(sizeof *m);
+    if (m == NULL) {
+        kivfs_pkt_free(req);
+        return KIVFS_ENOMEM;
+    }
+    m->kind        = MSG_REQUEST;
+    m->id          = id;
+    m->off         = 0;
+    m->tag         = tag;
+    m->deadline_ms = now_ms() + timeout_ms;   /* timeout běží od zavolání */
+    m->pkt         = *req;
+    req->data = NULL;
+    req->capacity = 0;
+    req->header.data_size = 0;
+    kivfs_proto_header_encode(&m->pkt.header, m->hdr);
+
+    return mailbox_post(r, m);
+}
+
+int kivfs_reactor_timer(struct kivfs_reactor *r, int delay_ms, uint64_t tag)
+{
+    if (r == NULL || delay_ms < 0 || r->cb.on_timer == NULL)
+        return KIVFS_EINVAL;
+    struct out_msg *m = calloc(1, sizeof *m);
+    if (m == NULL)
+        return KIVFS_ENOMEM;
+    m->kind        = MSG_TIMER;
+    m->tag         = tag;
+    m->deadline_ms = now_ms() + delay_ms;
+    return mailbox_post(r, m);
 }

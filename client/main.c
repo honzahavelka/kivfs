@@ -4,10 +4,11 @@
  *
  * Použití:  kivfs-client <host> <port>
  *
- * Po startu se připojí k uzlu, pošle HELLO (klient se představí jako
- * node_id 0) a pak čte příkazy ze stdin, jeden na řádek:
+ * Po startu se připojí k modulu Auth uzlu (klient smí JEN do Auth – viz
+ * hello.h), pošle HELLO (klient = node_id 0, modul CLIENT) a pak čte
+ * příkazy ze stdin, jeden na řádek:
  *
- *     hello        znovu pošle HELLO a vypíše node_id serveru
+ *     status       stav modulů uzlu a jejich propojení (STATUS přes Auth)
  *     ping [N]     N pingů (1..1000, výchozí 1), vypíše RTT
  *     help         seznam příkazů
  *     quit, exit   konec (stejně jako Ctrl-D)
@@ -39,7 +40,9 @@
 #include <unistd.h>
 
 #include "channel.h"
+#include "diag.h"
 #include "errors.h"
+#include "hello.h"
 #include "packet.h"
 #include "protocol.h"
 #include "socket.h"
@@ -52,6 +55,7 @@
 struct client {
     struct kivfs_chan ch;
     uint64_t clock;            /* čítač timestampů: ++ před každým odesláním */
+    uint64_t incarnation;      /* pro HELLO; u klienta jen informativní */
 };
 
 /* Výsledek příkazu – říká smyčce REPL, co dál. */
@@ -143,15 +147,13 @@ static int parse_uint(const char *s, unsigned long min, unsigned long max,
 static enum cmd_result do_hello(struct client *c, int *ok)
 {
     struct kivfs_packet req, resp;
-    struct kivfs_pkt_reader r;
-    uint64_t ref;
-    uint32_t node_id;
+    struct kivfs_hello me = { KIVFS_NODE_ID_UNKNOWN, KIVFS_MOD_CLIENT, KIVFS_PROTO_VERSION,
+                              c->incarnation, 0 };
+    struct kivfs_hello srv;
 
     *ok = 0;
-    kivfs_pkt_init(&req, KIVFS_REQ_HELLO, next_ts(c));
-    if (kivfs_pkt_add_u32(&req, KIVFS_NODE_ID_UNKNOWN) != KIVFS_OK) {
+    if (kivfs_hello_request(&req, next_ts(c), &me) != KIVFS_OK) {
         fprintf(stderr, "hello: nedostatek paměti\n");
-        kivfs_pkt_free(&req);
         return CMD_FATAL;
     }
 
@@ -161,21 +163,15 @@ static enum cmd_result do_hello(struct client *c, int *ok)
         return CMD_FATAL;
 
     if (resp.header.return_value != KIVFS_STATUS_OK) {
-        fprintf(stderr, "hello: server odmítl, status %s\n",
+        fprintf(stderr, "hello: server odmítl, status %s (klient se smí připojit jen k Auth)\n",
                 kivfs_status_str(resp.header.return_value));
+    } else if (kivfs_hello_parse_response(&resp, &srv) != KIVFS_OK) {
+        fprintf(stderr, "hello: neplatný formát odpovědi\n");
+    } else if (srv.module != KIVFS_MOD_AUTH || srv.node_id == KIVFS_NODE_ID_UNKNOWN) {
+        fprintf(stderr, "hello: na druhé straně není modul Auth\n");
     } else {
-        /* odpověď: [u64 ref][u32 node_id] – ref už zkontroloval chan_call */
-        kivfs_pkt_reader_init(&r, &resp);
-        if (kivfs_pkt_read_u64(&r, &ref) != KIVFS_OK
-            || kivfs_pkt_read_u32(&r, &node_id) != KIVFS_OK
-            || !kivfs_pkt_reader_at_end(&r)) {
-            fprintf(stderr, "hello: neplatný formát odpovědi\n");
-        } else if (node_id == KIVFS_NODE_ID_UNKNOWN) {
-            fprintf(stderr, "hello: server poslal node_id 0 (není to uzel?)\n");
-        } else {
-            c->ch.peer_node_id = node_id;
-            *ok = 1;
-        }
+        c->ch.peer_node_id = srv.node_id;
+        *ok = 1;
     }
     kivfs_pkt_free(&resp);
     return CMD_OK;
@@ -185,23 +181,46 @@ static enum cmd_result do_hello(struct client *c, int *ok)
 /* Příkazy                                                             */
 /* ------------------------------------------------------------------ */
 
-static enum cmd_result cmd_hello(struct client *c, int argc, char **argv)
+/* STATUS: Auth se zeptá Syncu, ten VFS a VFS DB a FS – vrátí blok
+ * každého modulu uzlu, který odpověděl. (HELLO se znovu poslat nedá:
+ * smí být jen jednou, na začátku spojení.) */
+static enum cmd_result cmd_status(struct client *c, int argc, char **argv)
 {
     (void)argv;
     if (argc != 1) {
-        fprintf(stderr, "použití: hello\n");
+        fprintf(stderr, "použití: status\n");
         return CMD_OK;
     }
-    int ok;
-    enum cmd_result res = do_hello(c, &ok);
-    if (ok)
-        printf("server node_id = %u\n", (unsigned)c->ch.peer_node_id);
-    return res;
+    struct kivfs_packet req, resp;
+    kivfs_pkt_init(&req, KIVFS_REQ_STATUS, next_ts(c));
+    int rc = do_call(c, &req, &resp);
+    kivfs_pkt_free(&req);
+    if (rc != KIVFS_OK)
+        return CMD_FATAL;
+    if (resp.header.return_value != KIVFS_STATUS_OK) {
+        fprintf(stderr, "status: %s\n", kivfs_status_str(resp.header.return_value));
+        kivfs_pkt_free(&resp);
+        return CMD_OK;
+    }
+
+    struct kivfs_pkt_reader r;
+    struct kivfs_diag_module d;
+    uint64_t ref;
+    kivfs_pkt_reader_init(&r, &resp);
+    kivfs_pkt_read_u64(&r, &ref);
+    while ((rc = kivfs_diag_read(&r, &d)) == KIVFS_OK) {
+        printf("%s@node%u  %s\n", kivfs_module_name(d.module), (unsigned)d.node,
+               d.ready ? "připraven" : "NEPŘIPRAVEN");
+        for (uint32_t i = 0; i < d.n_out; i++)
+            printf("    -> %s@node%u %s\n", kivfs_module_name(d.out[i].module),
+                   (unsigned)d.out[i].node, kivfs_link_state_str(d.out[i].state));
+    }
+    if (rc != KIVFS_EEND)
+        fprintf(stderr, "status: poškozená odpověď\n");
+    kivfs_pkt_free(&resp);
+    return CMD_OK;
 }
 
-/* Jeden ping: požadavek [u32 seq], očekávaná odpověď [u64 ref][u32 seq].
- * Vrací CMD_FATAL při chybě kanálu, jinak CMD_OK; *ok = 1, pokud odpověď
- * byla OK a sedí obsah, *rtt_ms = naměřený čas. */
 static enum cmd_result ping_once(struct client *c, uint32_t seq, int *ok, double *rtt_ms)
 {
     struct kivfs_packet req, resp;
@@ -299,7 +318,7 @@ struct command {
 };
 
 static const struct command COMMANDS[] = {
-    { "hello", cmd_hello, "hello        znovu pošle HELLO, vypíše node_id serveru" },
+    { "status", cmd_status, "status       stav modulů uzlu a jejich propojení" },
     { "ping",  cmd_ping,  "ping [N]     N pingů (1..1000, výchozí 1), vypíše RTT" },
     { "help",  cmd_help,  "help         tento přehled" },
     { "quit",  cmd_quit,  "quit, exit   konec (také Ctrl-D)" },
@@ -324,6 +343,7 @@ static int client_connect(struct client *c, const char *host, uint16_t port)
 {
     kivfs_chan_init(&c->ch);
     c->clock = 0;
+    c->incarnation = kivfs_incarnation_new();
 
     int rc = kivfs_chan_open(&c->ch, host, port, KIVFS_CHAN_DEFAULT_TIMEOUT_MS);
     if (rc != KIVFS_OK) {

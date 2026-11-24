@@ -1,0 +1,7 @@
+.git
+.idea
+.claude
+build
+build-docker
+cmake-build-*
+*.o

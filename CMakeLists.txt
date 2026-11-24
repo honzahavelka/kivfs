@@ -8,7 +8,8 @@ add_compile_options(-Wall -Wextra)
 # Vlákna (pthread) – používá je fronta, tedy celá společná knihovna
 find_package(Threads REQUIRED)
 
-# Společná knihovna
+# Společná knihovna: síťová vrstva (protokol, pakety, sockety, kanál)
+# a obecná fronta pro předávání práce mezi vlákny.
 add_library(common_lib
     common/errors.c
     common/errors.h
@@ -24,42 +25,32 @@ add_library(common_lib
     common/queue.h
     common/config.c
     common/config.h
-    common/log.c
-    common/log.h
+    common/hello.c
+    common/hello.h
+    common/diag.c
+    common/diag.h
 )
 target_include_directories(common_lib PUBLIC common)
 target_link_libraries(common_lib PUBLIC Threads::Threads)
 
-# Tabulka peerů (kanály k ostatním uzlům + kdo je na příchozím spojení).
-# Přenositelná – z reactor.h používá jen typ kivfs_conn_id.
-add_library(peers_lib
-    server/peers.c
-    server/peers.h
-)
-target_include_directories(peers_lib PUBLIC server)
-target_link_libraries(peers_lib PUBLIC common_lib)
-
-# Reactor (epoll) – jen Linux. Na macOS se server ani jeho testy
-# nepřekládají; cílové prostředí je Docker s Linuxem.
+# Reactor (epoll) pro příchozí i odchozí spojení + fronta událostí modulu – jen Linux. Na macOS se reactor
+# ani jeho test nepřekládají; cílové prostředí je Docker s Linuxem.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_library(reactor_lib
         server/reactor.c
         server/reactor.h
+        server/events.c
+        server/events.h
+        server/modconf.c
+        server/modconf.h
+        server/module.c
+        server/module.h
     )
     target_include_directories(reactor_lib PUBLIC server)
     target_link_libraries(reactor_lib PUBLIC common_lib)
 endif()
 
-# Server – potřebuje reactor (epoll), takže jen Linux. Na macOS se
-# překládá a spouští v Dockeru.
-if(TARGET reactor_lib)
-    add_executable(kivfs-server
-        server/main.c
-    )
-    target_link_libraries(kivfs-server PRIVATE reactor_lib peers_lib)
-endif()
-
-# Klient – přenositelný (Linux i macOS)
+# Klient – přenositelný (Linux i macOS); zatím jen hello + ping
 add_executable(kivfs-client
     client/main.c
 )
@@ -67,35 +58,11 @@ target_link_libraries(kivfs-client PRIVATE common_lib)
 
 # Testy (spuštění: ctest v build adresáři)
 enable_testing()
-add_executable(test_protocol
-    tests/test_protocol.c
-)
-target_link_libraries(test_protocol PRIVATE common_lib)
-add_test(NAME protocol COMMAND test_protocol)
-
-add_executable(test_channel
-    tests/test_channel.c
-)
-target_link_libraries(test_channel PRIVATE common_lib)
-add_test(NAME channel COMMAND test_channel)
-
-add_executable(test_queue
-    tests/test_queue.c
-)
-target_link_libraries(test_queue PRIVATE common_lib)
-add_test(NAME queue COMMAND test_queue)
-
-add_executable(test_config
-    tests/test_config.c
-)
-target_link_libraries(test_config PRIVATE common_lib)
-add_test(NAME config COMMAND test_config)
-
-add_executable(test_peers
-    tests/test_peers.c
-)
-target_link_libraries(test_peers PRIVATE peers_lib)
-add_test(NAME peers COMMAND test_peers)
+foreach(t protocol channel queue hello)
+    add_executable(test_${t} tests/test_${t}.c)
+    target_link_libraries(test_${t} PRIVATE common_lib)
+    add_test(NAME ${t} COMMAND test_${t})
+endforeach()
 
 if(TARGET reactor_lib)
     add_executable(test_reactor
@@ -103,4 +70,32 @@ if(TARGET reactor_lib)
     )
     target_link_libraries(test_reactor PRIVATE reactor_lib)
     add_test(NAME reactor COMMAND test_reactor)
+
+    foreach(t reactor_out events config)
+        add_executable(test_${t} tests/test_${t}.c)
+        target_link_libraries(test_${t} PRIVATE reactor_lib)
+        add_test(NAME ${t} COMMAND test_${t})
+    endforeach()
+    # test_config načítá šablony z conf/
+    target_compile_definitions(test_config PRIVATE KIVFS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+endif()
+
+# Serverové moduly (každý samostatný program nad společnou kostrou
+# server/module.c) a kontrola propojení clusteru – jen Linux.
+if(TARGET reactor_lib)
+    foreach(m auth sync vfs db fs)
+        add_executable(kivfs-${m} server/main_${m}.c)
+        target_link_libraries(kivfs-${m} PRIVATE reactor_lib)
+    endforeach()
+
+    add_executable(kivfs-check tools/check.c)
+    target_link_libraries(kivfs-check PRIVATE reactor_lib)
+
+    # Scénář: 3 uzly na jednom stroji, propojení, výpadek a obnova Syncu
+    add_test(NAME cluster_local
+             COMMAND ${CMAKE_SOURCE_DIR}/scripts/cluster-local.sh
+                     ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/conf/local)
+    set_tests_properties(cluster_local PROPERTIES
+        TIMEOUT 120
+        RUN_SERIAL TRUE)   # pevné porty 310xx–330xx
 endif()

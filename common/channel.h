@@ -18,10 +18,10 @@
  *     dva současné zápisy by se v TCP proudu proložily a rozbily pakety.
  *   - Na kanálu je vždy nejvýše jeden rozpracovaný požadavek. Díky tomu
  *     je další přijatý paket vždy odpověď na ten náš.
- *   - Modul NEMĚNÍ obsah paketů. Timestamp (Lamportovy hodiny) nastavuje
- *     před odesláním a zpracuje po přijetí modul Sync nad touto vrstvou.
- *   - Modul nedělá handshake HELLO (u uzlů ho dělá peers.h, u klienta
- *     client/main.c). peer_node_id vyplní volající po úspěšném HELLO.
+ *   - Modul NEMĚNÍ obsah paketů. Timestamp v hlavičce nastavuje volající
+ *     před odesláním (podle něj se páruje odpověď, viz kivfs_chan_call).
+ *   - Modul nedělá handshake HELLO – ten patří vrstvě nad kanálem.
+ *     peer_node_id vyplní volající po úspěšném HELLO.
  *   - Po JAKÉKOLI chybě send/recv/call je kanál nepoužitelný a musí se
  *     zavřít: nevíme, kolik bajtů z paketu prošlo, takže už nevíme, kde
  *     v TCP proudu začíná další paket. Případně se otevře nový kanál.

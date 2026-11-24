@@ -23,32 +23,16 @@
  * jak má být odmítnutá práce vyřízena – volající musí např. odpovědět
  * KIVFS_STATUS_BUSY a pak paket uvolnit.
  *
- * Použití v serveru (dvě instance – viz níže):
+ * Použití: obecný stavební kámen. V modulech ji nepoužívej přímo – je
+ * zabalená ve frontě událostí (server/events.h), která navíc hlídá, aby se
+ * výsledky odchozích požadavků nikdy neztratily.
  *
- *     struct job { kivfs_conn_id conn; struct kivfs_packet pkt; };
+ *     // producent, který čekat nesmí (I/O vlákno)
+ *     if (kivfs_queue_try_push(q, &item) != KIVFS_OK) { ... odmítnout ... }
  *
- *     // I/O vlákno – on_packet: NIKDY nečekat
- *     struct job j = { id, *pkt };
- *     if (kivfs_queue_try_push(q, &j) != KIVFS_OK) {
- *         ... odpovědět KIVFS_STATUS_BUSY, kivfs_pkt_free(&j.pkt) ...
- *     }
- *
- *     // worker
- *     struct job j;
- *     while (kivfs_queue_pop(q, &j) == KIVFS_OK) {
- *         ... zpracovat j.pkt, odpovědět přes kivfs_reactor_send(r, j.conn, &resp) ...
- *         kivfs_pkt_free(&j.pkt);
- *     }
+ *     // konzument (worker)
+ *     while (kivfs_queue_pop(q, &item) == KIVFS_OK) { ... }
  *     // KIVFS_ESHUTDOWN -> worker končí
- *
- * Server používá DVĚ fronty, aby nevznikl distribuovaný deadlock:
- *   - klientská: požadavky od CLI klientů; její workeři smí blokovat
- *     (volají jiné uzly přes channel.h)
- *   - uzlová: požadavky od jiných uzlů (+ HELLO); její workeři NIKDY
- *     neblokují, takže požadavek od jiného uzlu se zpracuje vždy, i když
- *     jsou všichni klientští workeři zablokovaní čekáním.
- * Díky pravidlu "jeden požadavek na spojení" (reactor.h) je v každé frontě
- * nejvýš tolik položek, kolik je spojení – kapacita max_conns nepřeteče.
  *
  * Návratové kódy: errors.h.
  */
