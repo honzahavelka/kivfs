@@ -25,6 +25,11 @@ const char *kivfs_strerror(int err)
     /* fronta / server */
     case KIVFS_ESHUTDOWN:   return "component is shutting down";
     case KIVFS_EINVAL:      return "invalid argument";
+
+    /* konfigurace / sync */
+    case KIVFS_ECONFIG:     return "invalid configuration";
+    case KIVFS_EPEERDOWN:   return "peer node unreachable";
+    case KIVFS_EPEERREJECT: return "peer node rejected handshake or identity mismatch";
     }
     return "unknown error";
 }

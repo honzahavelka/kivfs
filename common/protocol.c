@@ -55,6 +55,7 @@ const char *kivfs_status_str(int16_t status)
     case KIVFS_STATUS_ACCESS_DENIED: return "ACCESS_DENIED";
     case KIVFS_STATUS_BUSY:          return "BUSY";
     case KIVFS_STATUS_INTERNAL:      return "INTERNAL";
+    case KIVFS_STATUS_REJECTED:      return "REJECTED";
     }
     return "UNKNOWN_STATUS";
 }

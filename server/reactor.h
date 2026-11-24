@@ -58,7 +58,12 @@
  * cizímu klientovi a nesáhne do uvolněné paměti. */
 typedef uint64_t kivfs_conn_id;
 
-/* Generace začínají od 1, takže 0 nikdy není platné conn_id. */
+/* Záruka pro vrstvy nad reactorem: index slotu (dolních 32 bitů) je vždy
+ * < max_conns z konfigurace. Smí si tedy vést vlastní pole [max_conns]
+ * indexované slotem (např. peers.h: kdo je na spojení) a platnost položky
+ * ověřit porovnáním celého conn_id.
+ *
+ * Generace začínají od 1, takže 0 nikdy není platné conn_id. */
 #define KIVFS_CONN_ID_INVALID 0u
 
 /* Proč spojení skončilo – pro logy a pro modul Sync (detekce pádu uzlu). */

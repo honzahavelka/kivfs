@@ -20,8 +20,8 @@
  *     je další přijatý paket vždy odpověď na ten náš.
  *   - Modul NEMĚNÍ obsah paketů. Timestamp (Lamportovy hodiny) nastavuje
  *     před odesláním a zpracuje po přijetí modul Sync nad touto vrstvou.
- *   - Modul nedělá handshake HELLO (ten nese Lamportův čas, tedy patří
- *     Sync). peer_node_id vyplní volající po úspěšném HELLO.
+ *   - Modul nedělá handshake HELLO (u uzlů ho dělá peers.h, u klienta
+ *     client/main.c). peer_node_id vyplní volající po úspěšném HELLO.
  *   - Po JAKÉKOLI chybě send/recv/call je kanál nepoužitelný a musí se
  *     zavřít: nevíme, kolik bajtů z paketu prošlo, takže už nevíme, kde
  *     v TCP proudu začíná další paket. Případně se otevře nový kanál.
@@ -90,5 +90,20 @@ int  kivfs_chan_recv(struct kivfs_chan *c, struct kivfs_packet *out);
  * dopadla u protistrany, říká resp->header.return_value (kivfs_status). */
 int  kivfs_chan_call(struct kivfs_chan *c, const struct kivfs_packet *req,
                      struct kivfs_packet *resp);
+
+/* Přijme odpověď a ověří, že patří k už odeslanému požadavku req
+ * (stejné kontroly jako kivfs_chan_call). Pro send-all / recv-all:
+ * nejdřív kivfs_chan_send na všechny kanály, pak tohle ze všech.
+ * Při chybě je resp prázdný paket (nic k uvolnění). */
+int  kivfs_chan_recv_response(struct kivfs_chan *c, const struct kivfs_packet *req,
+                              struct kivfs_packet *resp);
+
+/* Je nečinný kanál zastaralý? Na odchozím kanálu smí přijít data jen jako
+ * odpověď na náš požadavek. Je-li socket čitelný, když nic nečekáme,
+ * protistrana ho zavřela (FIN/RST, např. po restartu) nebo porušila
+ * protokol – v obou případech je kanál k ničemu. Nečeká (poll s nulovým
+ * timeoutem). Zavřený kanál (fd -1) je také zastaralý.
+ * Pád protistrany BEZ FIN (výpadek sítě/napájení) se takhle nepozná. */
+int  kivfs_chan_is_stale(const struct kivfs_chan *c);
 
 #endif /* KIVFS_CHANNEL_H */

@@ -1,0 +1,74 @@
+# KIVFS – lokální cluster ze 3 uzlů, každý ve vlastním kontejneru.
+#
+# Použití (v adresáři projektu na Macu):
+#   docker compose up --build          přeloží projekt a spustí node1..3 (logy v terminálu)
+#   docker compose up -d --build       totéž na pozadí; logy: docker compose logs -f
+#   docker compose run --rm client node2 9000
+#                                      interaktivní klient uvnitř sítě clusteru
+#   docker compose stop node2          simulace výpadku uzlu (SIGTERM -> čisté vypnutí)
+#   docker compose kill node2          simulace pádu (SIGKILL, bez úklidu)
+#   docker compose start node2         uzel znovu naběhne
+#   docker compose restart node1 node2 node3
+#                                      po změně kódu: znovu přeložit a restartovat uzly
+#                                      (překlad: docker compose run --rm build)
+#   docker compose down                vše zastavit a smazat kontejnery
+#
+# Zdrojáky jsou do všech kontejnerů připojené z Macu (/kivfs), takže obraz
+# se staví jen při změně Dockerfile. Překlad jde do build-docker/, aby se
+# nepletl s build/ a cmake-build-*/ (jiné cesty v CMakeCache).
+#
+# Uzly jsou dostupné i z Macu: localhost:9001 (node1), :9002, :9003.
+
+x-kivfs: &kivfs
+  image: kivfs-dev
+  pull_policy: never        # obraz staví služba build, nikdy ho nestahovat
+  volumes:
+    - .:/kivfs
+  working_dir: /kivfs
+  init: true                # malý init jako PID 1: předá signály, uklidí zombie
+
+services:
+  # Jednorázový překlad; uzly startují až po jeho úspěšném dokončení.
+  build:
+    <<: *kivfs
+    build: .
+    pull_policy: build
+    command: >
+      bash -c "cmake -S /kivfs -B /kivfs/build-docker -DCMAKE_BUILD_TYPE=Debug
+      && cmake --build /kivfs/build-docker -j"
+
+  node1:
+    <<: *kivfs
+    hostname: node1
+    command: ["/kivfs/build-docker/kivfs-server", "/kivfs/conf/docker-node1.conf"]
+    ports: ["9001:9000"]
+    depends_on:
+      build:
+        condition: service_completed_successfully
+
+  node2:
+    <<: *kivfs
+    hostname: node2
+    command: ["/kivfs/build-docker/kivfs-server", "/kivfs/conf/docker-node2.conf"]
+    ports: ["9002:9000"]
+    depends_on:
+      build:
+        condition: service_completed_successfully
+
+  node3:
+    <<: *kivfs
+    hostname: node3
+    command: ["/kivfs/build-docker/kivfs-server", "/kivfs/conf/docker-node3.conf"]
+    ports: ["9003:9000"]
+    depends_on:
+      build:
+        condition: service_completed_successfully
+
+  # Interaktivní klient; spouští se jen ručně (profil tools):
+  #   docker compose run --rm client node1 9000
+  client:
+    <<: *kivfs
+    profiles: ["tools"]
+    entrypoint: ["/kivfs/build-docker/kivfs-client"]
+    stdin_open: true
+    tty: true

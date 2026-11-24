@@ -96,9 +96,17 @@ enum kivfs_request_code {
     /*
      * HELLO – první paket na každém novém spojení (handshake).
      * Strana, která se připojila, se představí; druhá strana odpoví svým ID.
-     * Teprve potom smí po spojení jít cokoli jiného.
-     *   požadavek: [u32 node_id]            (CLI klient posílá KIVFS_NODE_ID_UNKNOWN)
+     * Teprve potom smí po spojení jít cokoli jiného (jinak server spojení
+     * zavře).
+     *   požadavek: [u32 node_id]                   CLI klient (KIVFS_NODE_ID_UNKNOWN)
+     *              [u32 node_id][u64 cluster_fp]   uzel; cluster_fp viz
+     *                                              kivfs_config_fingerprint
      *   odpověď:   [u64 req_ts][u32 node_id]
+     * Chybové stavy: MALFORMED (špatný payload, uzel bez otisku, druhé HELLO),
+     * REJECTED (neznámé id, vlastní id příjemce, nesedí otisk) – po chybové
+     * odpovědi příjemce spojení zavře.
+     * Přijde-li HELLO od uzlu, který už má živé spojení, staré se zavře
+     * (novější vyhrává – staré mohlo zůstat viset po pádu bez FIN).
      */
     KIVFS_REQ_HELLO = 1,
 
@@ -111,6 +119,18 @@ enum kivfs_request_code {
      * CLI klient posílá jeden záznam [u32 seq] a kontroluje, že se vrátil.
      */
     KIVFS_REQ_PING = 2,
+
+    /*
+     * NODES – diagnostika clusteru (klientský příkaz "nodes"). Server zkusí
+     * PING na každý ostatní uzel (líně se přitom připojí) a vrátí výsledky.
+     *   požadavek: nic
+     *   odpověď:   [u64 req_ts] + pro každý ostatní uzel 4 záznamy:
+     *              [u32 node_id][u32 výsledek][u32 rtt_us][u32 příchozí]
+     *     výsledek = lokální kód z errors.h (int32 jako u32), 0 = PING prošel
+     *     rtt_us   = doba PINGu včetně případného připojení a HELLO
+     *     příchozí = 1, pokud má ten uzel živé spojení k nám
+     */
+    KIVFS_REQ_NODES = 3,
 
     /* ... další kódy doplnit podle specifikace ... */
 };
@@ -128,8 +148,10 @@ enum kivfs_status {
     KIVFS_STATUS_EXISTS        = -4,   /* soubor/adresář už existuje */
     KIVFS_STATUS_ACCESS_DENIED = -5,   /* nedostatečná práva */
     KIVFS_STATUS_BUSY          = -6,   /* dočasně nelze (zámek apod.), zkus znovu */
-    KIVFS_STATUS_INTERNAL      = -7    /* chyba na straně odpovídajícího
+    KIVFS_STATUS_INTERNAL      = -7,   /* chyba na straně odpovídajícího
                                         * (DB, disk...); detail jen v jeho logu */
+    KIVFS_STATUS_REJECTED      = -8    /* HELLO odmítnuto (neznámý uzel, jiný
+                                        * seznam uzlů); spojení se zavře */
 };
 
 /* Vrátí statický název stavu pro výpisy a logy ("OK", "BUSY", ...).

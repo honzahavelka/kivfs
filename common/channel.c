@@ -1,7 +1,16 @@
+/* poll(): stejné makro jako v socket.c (na macOS by čisté POSIX makro
+ * schovalo i věci, které potřebují systémové hlavičky). */
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE
+#else
+#  define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "channel.h"
 #include "errors.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -118,7 +127,13 @@ int kivfs_chan_call(struct kivfs_chan *c, const struct kivfs_packet *req,
         return rc;
     }
 
-    rc = kivfs_chan_recv(c, resp);
+    return kivfs_chan_recv_response(c, req, resp);
+}
+
+int kivfs_chan_recv_response(struct kivfs_chan *c, const struct kivfs_packet *req,
+                             struct kivfs_packet *resp)
+{
+    int rc = kivfs_chan_recv(c, resp);
     if (rc != KIVFS_OK)
         return rc;
 
@@ -132,4 +147,18 @@ int kivfs_chan_call(struct kivfs_chan *c, const struct kivfs_packet *req,
         return KIVFS_EUNEXPECTED;
     }
     return KIVFS_OK;
+}
+
+int kivfs_chan_is_stale(const struct kivfs_chan *c)
+{
+    if (c->fd < 0)
+        return 1;
+    struct pollfd pfd = { .fd = c->fd, .events = POLLIN, .revents = 0 };
+    int n;
+    do {
+        n = poll(&pfd, 1, 0);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0)
+        return 1;               /* nejde ani zjistit stav -> nevěřit mu */
+    return n > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0;
 }

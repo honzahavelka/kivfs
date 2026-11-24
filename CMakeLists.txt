@@ -22,9 +22,22 @@ add_library(common_lib
     common/channel.h
     common/queue.c
     common/queue.h
+    common/config.c
+    common/config.h
+    common/log.c
+    common/log.h
 )
 target_include_directories(common_lib PUBLIC common)
 target_link_libraries(common_lib PUBLIC Threads::Threads)
+
+# Tabulka peerů (kanály k ostatním uzlům + kdo je na příchozím spojení).
+# Přenositelná – z reactor.h používá jen typ kivfs_conn_id.
+add_library(peers_lib
+    server/peers.c
+    server/peers.h
+)
+target_include_directories(peers_lib PUBLIC server)
+target_link_libraries(peers_lib PUBLIC common_lib)
 
 # Reactor (epoll) – jen Linux. Na macOS se server ani jeho testy
 # nepřekládají; cílové prostředí je Docker s Linuxem.
@@ -43,7 +56,7 @@ if(TARGET reactor_lib)
     add_executable(kivfs-server
         server/main.c
     )
-    target_link_libraries(kivfs-server PRIVATE reactor_lib)
+    target_link_libraries(kivfs-server PRIVATE reactor_lib peers_lib)
 endif()
 
 # Klient – přenositelný (Linux i macOS)
@@ -71,6 +84,18 @@ add_executable(test_queue
 )
 target_link_libraries(test_queue PRIVATE common_lib)
 add_test(NAME queue COMMAND test_queue)
+
+add_executable(test_config
+    tests/test_config.c
+)
+target_link_libraries(test_config PRIVATE common_lib)
+add_test(NAME config COMMAND test_config)
+
+add_executable(test_peers
+    tests/test_peers.c
+)
+target_link_libraries(test_peers PRIVATE peers_lib)
+add_test(NAME peers COMMAND test_peers)
 
 if(TARGET reactor_lib)
     add_executable(test_reactor
