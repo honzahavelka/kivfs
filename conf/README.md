@@ -3,8 +3,8 @@
 Jeden INI soubor na **uzel**; stejný soubor dostanou všechny moduly
 (a všechny stroje) daného uzlu. Modul se spouští `kivfs-<modul> -c soubor.ini`
 a čte z něj `[cluster]`, svou sekci a sekce modulů, které volá
-(Auth → Sync → VFS → DB, FS). Formát a validace: `common/config.h`,
-`server/modconf.h`.
+(Auth → Sync → VFS → DB, FS). Formát a validace: `common/util/config.h`,
+`server/core/modconf.h`.
 
 | Šablona | Kdy |
 |---|---|
@@ -21,7 +21,7 @@ Pravidla, která se snadno přehlédnou:
 
 ## Spuštění scénářů
 
-- **Jeden stroj** (`local/`): `scripts/cluster-local.sh <build>` – spustí
+- **Jeden stroj** (`local/`): `tests/scenarios/cluster-local.sh <build>` – spustí
   15 procesů, ověří propojení, zastaví a znovu spustí `sync@node2`
   (výpadek a obnova), vše ukončí. Běží i v `ctest` jako `cluster_local`.
 - **Tři kontejnery** (`3nodes/`):

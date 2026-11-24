@@ -39,13 +39,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "channel.h"
-#include "diag.h"
-#include "errors.h"
-#include "hello.h"
-#include "packet.h"
-#include "protocol.h"
-#include "socket.h"
+#include "net/channel.h"
+#include "proto/diag.h"
+#include "proto/errors.h"
+#include "proto/hello.h"
+#include "proto/packet.h"
+#include "proto/protocol.h"
+#include "net/socket.h"
 
 #define LINE_MAX_LEN   256     /* včetně '\n' a '\0' */
 #define MAX_ARGS       8

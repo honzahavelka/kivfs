@@ -27,14 +27,14 @@
 #include <string.h>
 #include <time.h>
 
-#include "channel.h"
-#include "config.h"
-#include "diag.h"
-#include "errors.h"
-#include "hello.h"
-#include "modconf.h"
-#include "protocol.h"
-#include "socket.h"
+#include "net/channel.h"
+#include "util/config.h"
+#include "proto/diag.h"
+#include "proto/errors.h"
+#include "proto/hello.h"
+#include "core/modconf.h"
+#include "proto/protocol.h"
+#include "net/socket.h"
 
 #define MAX_FILES        KIVFS_MAX_NODES
 #define STATUS_TIMEOUT   5000
