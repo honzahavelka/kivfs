@@ -9,7 +9,6 @@
  *
  *     hello        znovu pošle HELLO a vypíše node_id serveru
  *     ping [N]     N pingů (1..1000, výchozí 1), vypíše RTT
- *     nodes        server pingne ostatní uzly clusteru a vypíše jejich stav
  *     help         seznam příkazů
  *     quit, exit   konec (stejně jako Ctrl-D)
  *
@@ -284,54 +283,6 @@ static enum cmd_result cmd_ping(struct client *c, int argc, char **argv)
     return res;
 }
 
-/* NODES: odpověď [u64 ref] + po 4 záznamech na uzel
- * [u32 node_id][u32 výsledek][u32 rtt_us][u32 příchozí] (protocol.h). */
-static enum cmd_result cmd_nodes(struct client *c, int argc, char **argv)
-{
-    (void)argv;
-    if (argc != 1) {
-        fprintf(stderr, "použití: nodes\n");
-        return CMD_OK;
-    }
-    struct kivfs_packet req, resp;
-    kivfs_pkt_init(&req, KIVFS_REQ_NODES, next_ts(c));
-    int rc = do_call(c, &req, &resp);
-    kivfs_pkt_free(&req);
-    if (rc != KIVFS_OK)
-        return CMD_FATAL;
-
-    if (resp.header.return_value != KIVFS_STATUS_OK) {
-        printf("nodes: status %s\n", kivfs_status_str(resp.header.return_value));
-        kivfs_pkt_free(&resp);
-        return CMD_OK;
-    }
-
-    struct kivfs_pkt_reader r;
-    uint64_t ref;
-    uint32_t id, result, rtt, in;
-    kivfs_pkt_reader_init(&r, &resp);
-    kivfs_pkt_read_u64(&r, &ref);
-    printf("uzly viděné z uzlu %u:\n", (unsigned)c->ch.peer_node_id);
-    printf("  %-6s %-10s %10s  %s\n", "uzel", "odchozí", "rtt", "příchozí");
-    while (!kivfs_pkt_reader_at_end(&r)) {
-        if (kivfs_pkt_read_u32(&r, &id) != KIVFS_OK
-            || kivfs_pkt_read_u32(&r, &result) != KIVFS_OK
-            || kivfs_pkt_read_u32(&r, &rtt) != KIVFS_OK
-            || kivfs_pkt_read_u32(&r, &in) != KIVFS_OK) {
-            printf("nodes: neplatný formát odpovědi\n");
-            break;
-        }
-        int err = (int)(int32_t)result;
-        printf("  %-6u %-10s %8.3f ms  %s", (unsigned)id, err == KIVFS_OK ? "OK" : "CHYBA",
-               (double)rtt / 1000.0, in ? "ano" : "ne");
-        if (err != KIVFS_OK)
-            printf("   (%s)", kivfs_strerror(err));
-        printf("\n");
-    }
-    kivfs_pkt_free(&resp);
-    return CMD_OK;
-}
-
 static enum cmd_result cmd_help(struct client *c, int argc, char **argv);
 
 static enum cmd_result cmd_quit(struct client *c, int argc, char **argv)
@@ -350,7 +301,6 @@ struct command {
 static const struct command COMMANDS[] = {
     { "hello", cmd_hello, "hello        znovu pošle HELLO, vypíše node_id serveru" },
     { "ping",  cmd_ping,  "ping [N]     N pingů (1..1000, výchozí 1), vypíše RTT" },
-    { "nodes", cmd_nodes, "nodes        stav ostatních uzlů (server je pingne)" },
     { "help",  cmd_help,  "help         tento přehled" },
     { "quit",  cmd_quit,  "quit, exit   konec (také Ctrl-D)" },
     { "exit",  cmd_quit,  NULL },       /* alias, v nápovědě se nevypisuje */

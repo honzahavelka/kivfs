@@ -24,7 +24,6 @@
  *    -1 ..  -19   protocol / packet
  *   -20 ..  -39   socket / channel
  *   -40 ..  -59   fronta / server
- *   -60 ..  -79   konfigurace / sync
  *
  * Typické použití:
  *     int rc = kivfs_chan_call(&ch, &req, &resp);
@@ -75,19 +74,8 @@ enum kivfs_err {
     /* ---- fronta / server ---- */
     KIVFS_ESHUTDOWN   = -40,  /* Komponenta (fronta, reactor) se ukončuje.
                                * Pro workera signál "skonči". */
-    KIVFS_EINVAL      = -41,  /* Neplatný argument funkce (např. nulová
+    KIVFS_EINVAL      = -41   /* Neplatný argument funkce (např. nulová
                                * kapacita fronty) – chyba volajícího. */
-
-    /* ---- konfigurace / sync ---- */
-    KIVFS_ECONFIG     = -60,  /* Neplatný konfigurační soubor (syntaxe nebo
-                               * hodnota). Podrobnosti s číslem řádku vrací
-                               * kivfs_config_load v textu chyby. */
-    KIVFS_EPEERDOWN   = -61,  /* Uzel je nedostupný: připojení selhalo, nebo
-                               * po nedávném neúspěchu ještě běží backoff
-                               * (peers.h). Klient dostane BUSY. */
-    KIVFS_EPEERREJECT = -62   /* HELLO s uzlem neprošlo: odmítl nás (jiný
-                               * seznam uzlů, neznámé id), nebo na adrese
-                               * odpověděl jiný uzel, než čekáme. */
 };
 
 /* Vrátí statický textový popis chyby pro logy (řetězec se neuvolňuje).
