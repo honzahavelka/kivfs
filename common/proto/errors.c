@@ -26,6 +26,9 @@ const char *kivfs_strerror(int err)
     /* fronta / server */
     case KIVFS_ESHUTDOWN:   return "component is shutting down";
     case KIVFS_EINVAL:      return "invalid argument";
+    case KIVFS_ENOTREADY:   return "dependency not ready";
+    case KIVFS_ENOENT:      return "no such entry";
+    case KIVFS_EPROTO:      return "protocol violation";
 
     /* konfigurace */
     case KIVFS_ECONFIG:     return "invalid configuration";

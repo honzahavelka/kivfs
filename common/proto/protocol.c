@@ -59,6 +59,8 @@ const char *kivfs_status_str(int16_t status)
     case KIVFS_STATUS_UNAVAILABLE:   return "UNAVAILABLE";
     case KIVFS_STATUS_NOT_DIR:       return "NOT_DIR";
     case KIVFS_STATUS_NOT_EMPTY:     return "NOT_EMPTY";
+    case KIVFS_STATUS_TIMEOUT:       return "TIMEOUT";
+    case KIVFS_STATUS_VIEW_MISMATCH: return "VIEW_MISMATCH";
     }
     return "UNKNOWN_STATUS";
 }

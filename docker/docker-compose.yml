@@ -3,7 +3,7 @@
 # Spuštění a kontrola propojení (z kořene projektu):
 #   docker compose -f docker/docker-compose.yml up --build \
 #       --abort-on-container-exit --exit-code-from check
-# Exit kód = výsledek kivfs-check (0 = 15 modulů a 18 spojení OK).
+# Exit kód = výsledek kivfs-check (0 = 15 modulů a 24 spojení OK).
 #
 # Jen uzly (ruční zkoušení výpadků: docker compose stop node2 ...):
 #   docker compose -f docker/docker-compose.yml up --build -d node1 node2 node3

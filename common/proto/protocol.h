@@ -12,8 +12,10 @@
  *
  *   offset  size  pole
  *   0       4     magic_number   = KIVFS_MAGIC
- *   4       8     timestamp      Lamportův čas odesílatele
- *                                (odesílatel inkrementuje hodiny PŘED každým odesláním)
+ *   4       8     timestamp      čítač odesílatele pro párování odpovědí
+ *                                (odesílatel ho zvýší PŘED každým odesláním);
+ *                                NEJSOU to Lamportovy hodiny – ty má jen Sync
+ *                                a posílá je v payloadu (syncproto.h)
  *   12      2     request_code   kód požadavku; odpověď má navíc KIVFS_RESPONSE_FLAG
  *   14      2     return_value   int16 (two's complement);
  *                                požadavek: 0, odpověď: enum kivfs_status
@@ -53,9 +55,9 @@
  *   - ID uzlu odesílatele se v paketech nenese; je známé ze spojení,
  *     protože ho protistrana sdělila v úvodním HELLO
  *   - dvojice (node_id spojení, timestamp požadavku) jednoznačně určuje
- *     požadavek: každý uzel před každým odesláním zvýší své hodiny, takže
+ *     požadavek: každý uzel před každým odesláním zvýší svůj čítač, takže
  *     tentýž uzel nikdy nepošle dvě zprávy se stejným timestampem
- *     (POZOR: platí jen dokud uzel nerestartuje s hodinami od nuly)
+ *     (POZOR: platí jen dokud uzel nerestartuje s čítačem od nuly)
  */
 
 #include <stdint.h>
@@ -166,6 +168,9 @@ enum kivfs_request_code {
     /* ---------------------------------------------------------------
      * Interní operace DB (100–199): VFS -> DB. DB je úložiště, práva
      * nekontroluje (dělá to VFS); kontroluje jen konzistenci stromu.
+     * GET/LIST lokálně. MKNODE/RMNODE jdou přes Sync (SYNC_SUBMIT ->
+     * kolo Tdb -> DB_APPLY na všech uzlech); navíc mohou vrátit
+     * UNAVAILABLE / BUSY (jistě neproběhlo) a TIMEOUT (výsledek neznámý).
      * --------------------------------------------------------------- */
 
     /* DB_GET    req [path]                          resp [ref][attr] */
@@ -179,6 +184,49 @@ enum kivfs_request_code {
     /* DB_RMNODE req [path]                          resp [ref]
      *           adresář musí být prázdný (NOT_EMPTY), "/" nejde (ACCESS_DENIED) */
     KIVFS_REQ_DB_RMNODE = 103,
+
+    /* ---------------------------------------------------------------
+     * Replikace DB (110–119): Sync -> DB stejného uzlu. Struktury
+     * (arch_hdr, dbop, „archivovaná operace“): syncproto.h, sémantika
+     * DB_APPLY tamtéž a v db/backend.h. Jen od Syncu (jinak ACCESS_DENIED).
+     * --------------------------------------------------------------- */
+
+    /* DB_APPLY    req [arch_hdr][dbop][záznamy op]   resp [ref] + výsledek op
+     *             provede dohodnutou operaci a zapíše ji do MESSAGE_LOGS
+     *             v JEDNÉ transakci; čas z dbop, id nového uzlu z indexu;
+     *             INTERNAL = nic se nestalo; jiný stav = index spotřebován */
+    KIVFS_REQ_DB_APPLY    = 110,
+    /* DB_LOG_READ req [u64 from_index][u32 max]      resp [ref][archivovaná op]...
+     *             from_index >= 1; max <= KIVFS_SYNC_FETCH_MAX; vrátí méně,
+     *             když se nevejdou */
+    KIVFS_REQ_DB_LOG_READ = 111,
+    /* DB_LOG_HEAD req []                             resp [ref][u64 last_index] */
+    KIVFS_REQ_DB_LOG_HEAD = 112,
+
+    /* ---------------------------------------------------------------
+     * Sync (300–399), NÁVRH 25. 11., zatím neimplementováno. Struktury
+     * a pravidla hlasování: syncproto.h. Sync <-> Sync jiných uzlů
+     * (300–309) – každý požadavek začíná [sync_hdr].
+     * --------------------------------------------------------------- */
+
+    /* SYNC_PROPOSE req [sync_hdr t=Ttmp] (+ [dbop][záznamy op] jen pruh DB)
+     *              resp [ref][u64 t_navrzene]       t_navrzene = max(t_in, T + 1) */
+    KIVFS_REQ_SYNC_PROPOSE = 300,
+    /* SYNC_COMMIT  req [sync_hdr t=T_final]        resp [ref] */
+    KIVFS_REQ_SYNC_COMMIT  = 301,
+    /* SYNC_ABORT   req [sync_hdr]                  resp [ref] */
+    KIVFS_REQ_SYNC_ABORT   = 302,
+    /* SYNC_QUERY   req [sync_hdr]                  resp [ref][sync_state] */
+    KIVFS_REQ_SYNC_QUERY   = 303,
+    /* SYNC_CLOCK   req []                          resp [ref][sync_clock] */
+    KIVFS_REQ_SYNC_CLOCK   = 304,
+    /* SYNC_FETCH   req [u64 from_index][u32 max]   resp [ref][archivovaná op]... */
+    KIVFS_REQ_SYNC_FETCH   = 305,
+    /* SYNC_SUBMIT  (DB -> Sync stejného uzlu)
+     *              req [dbop][záznamy op]          resp [ref] + výsledek DB_APPLY
+     *              odpověď až po lokálním APPLY; velikost nejvýš
+     *              KIVFS_MAX_PAYLOAD - KIVFS_SYNC_PAYLOAD_RESERVE */
+    KIVFS_REQ_SYNC_SUBMIT  = 310,
 
     /* ... další kódy doplnit podle specifikace ... */
 };
@@ -204,7 +252,13 @@ enum kivfs_status {
     KIVFS_STATUS_UNAVAILABLE   = -9,   /* chybí závislost (např. VFS nemá DB),
                                         * zkus později */
     KIVFS_STATUS_NOT_DIR       = -10,  /* složka cesty (nebo cíl) není adresář */
-    KIVFS_STATUS_NOT_EMPTY     = -11   /* rmdir neprázdného adresáře */
+    KIVFS_STATUS_NOT_EMPTY     = -11,  /* rmdir neprázdného adresáře */
+    KIVFS_STATUS_TIMEOUT       = -12,  /* výsledek NEZNÁMÝ – operace mohla
+                                        * proběhnout (na rozdíl od UNAVAILABLE,
+                                        * které znamená „jistě neprovedeno“) */
+    KIVFS_STATUS_VIEW_MISMATCH = -13   /* Sync: nesedí epocha pohledu, nebo
+                                        * odesílatel není členem pohledu
+                                        * (i stará incarnation) */
 };
 
 /* Vrátí statický název stavu pro výpisy a logy ("OK", "BUSY", ...).

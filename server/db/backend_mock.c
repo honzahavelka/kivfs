@@ -1,10 +1,15 @@
 /*
- * KIVFS – mock úložiště metadat: strom v paměti (viz db/backend.h)
+ * KIVFS – mock úložiště metadat: strom + archiv v paměti (viz db/backend.h)
  *
  * Uzel = atributy + jméno + seřazené pole potomků (binární hledání,
  * vkládání posunem). Pro desítky až tisíce položek v adresáři stačí;
  * je to náhrada MySQL pro vývoj a testy, ne cílové řešení.
- * Data se při ukončení procesu ztratí.
+ * Archiv (MESSAGE_LOGS) = pole záznamů, log[i].index == i + 1.
+ * Data i archiv se při ukončení procesu ztratí.
+ *
+ * Atomicita apply: nejdřív se připraví vše, co může selhat (místo
+ * v archivu, kopie operace, nový uzel, místo v poli potomků), teprve pak
+ * se mění strom a archiv – selhání = INTERNAL bez jakékoli změny.
  */
 #include "db/backend.h"
 #include "proto/errors.h"
@@ -21,10 +26,19 @@ struct node {
     size_t            nkids, capkids;
 };
 
+struct logent {
+    uint64_t           t;
+    struct kivfs_op_id op;
+    int16_t            status;
+    uint8_t           *dbop;
+    uint32_t           dbop_len;
+};
+
 struct mock {
     struct kivfs_dbb base;           /* musí být první (přetypování) */
     struct node     *root;
-    uint64_t         next_id;
+    struct logent   *log;            /* log[i] má index i + 1 */
+    size_t           nlog, caplog;
 };
 
 static int is_dir(const struct node *n)
@@ -85,7 +99,7 @@ static void free_node(struct node *n)
 }
 
 /* ------------------------------------------------------------------ */
-/* Operace                                                             */
+/* Čtení                                                               */
 /* ------------------------------------------------------------------ */
 
 static int16_t mock_get(struct kivfs_dbb *b, const char *path, struct kivfs_attr *out)
@@ -95,58 +109,6 @@ static int16_t mock_get(struct kivfs_dbb *b, const char *path, struct kivfs_attr
     if (st == KIVFS_STATUS_OK)
         *out = n->a;
     return st;
-}
-
-static int16_t mock_mknode(struct kivfs_dbb *b, const char *path, uint32_t mode,
-                           uint32_t uid, uint32_t gid, uint64_t now_ms, struct kivfs_attr *out)
-{
-    struct mock *m = (struct mock *)b;
-    char parent_path[KIVFS_PATH_MAX + 1];
-    const char *name;
-    struct node *dir;
-
-    if (kivfs_path_split(path, parent_path, &name) != KIVFS_OK)
-        return KIVFS_STATUS_EXISTS;              /* "/" existuje vždy */
-    int16_t st = lookup(m, parent_path, &dir);
-    if (st != KIVFS_STATUS_OK)
-        return st;
-    if (!is_dir(dir))
-        return KIVFS_STATUS_NOT_DIR;
-    long i = find_kid(dir, name, strlen(name));
-    if (i >= 0)
-        return KIVFS_STATUS_EXISTS;
-    size_t pos = (size_t)(-i - 1);
-
-    if (dir->nkids == dir->capkids) {
-        size_t cap = dir->capkids ? dir->capkids * 2 : 8;
-        struct node **k = realloc(dir->kids, cap * sizeof *k);
-        if (k == NULL)
-            return KIVFS_STATUS_INTERNAL;
-        dir->kids = k;
-        dir->capkids = cap;
-    }
-    struct node *n = calloc(1, sizeof *n);
-    if (n == NULL || (n->name = malloc(strlen(name) + 1)) == NULL) {
-        free(n);
-        return KIVFS_STATUS_INTERNAL;
-    }
-    strcpy(n->name, name);
-    n->parent     = dir;
-    n->a.id       = m->next_id++;
-    n->a.mode     = mode;
-    n->a.uid      = uid;
-    n->a.gid      = gid;
-    n->a.size     = 0;
-    n->a.mtime_ms = now_ms;
-    n->a.ctime_ms = now_ms;
-
-    memmove(&dir->kids[pos + 1], &dir->kids[pos], (dir->nkids - pos) * sizeof *dir->kids);
-    dir->kids[pos] = n;
-    dir->nkids++;
-    dir->a.mtime_ms = now_ms;                    /* obsah adresáře se změnil */
-    if (out != NULL)
-        *out = n->a;
-    return KIVFS_STATUS_OK;
 }
 
 static int16_t mock_list(struct kivfs_dbb *b, const char *path,
@@ -165,27 +127,195 @@ static int16_t mock_list(struct kivfs_dbb *b, const char *path,
     return KIVFS_STATUS_OK;
 }
 
-static int16_t mock_rmnode(struct kivfs_dbb *b, const char *path, uint64_t now_ms)
+/* ------------------------------------------------------------------ */
+/* Zápis: příprava (může selhat, nic nemění) + provedení (nesmí selhat) */
+/* ------------------------------------------------------------------ */
+
+/* Připravená změna stromu. */
+struct prep {
+    struct node *dir;                /* rodič */
+    struct node *n;                  /* MKNODE: nový uzel; RMNODE: mazaný */
+    size_t       pos;                /* pozice v dir->kids */
+};
+
+/* Zajistí místo pro jednoho dalšího potomka (realloc nic nemění na obsahu). */
+static int reserve_kid(struct node *dir)
 {
-    struct mock *m = (struct mock *)b;
-    struct node *n;
-    if (strcmp(path, "/") == 0)
-        return KIVFS_STATUS_ACCESS_DENIED;
-    int16_t st = lookup(m, path, &n);
+    if (dir->nkids < dir->capkids)
+        return 0;
+    size_t cap = dir->capkids ? dir->capkids * 2 : 8;
+    struct node **k = realloc(dir->kids, cap * sizeof *k);
+    if (k == NULL)
+        return -1;
+    dir->kids = k;
+    dir->capkids = cap;
+    return 0;
+}
+
+/* MKNODE: podmínky + alokace. OK -> p vyplněno; jinak stav podmínky
+ * (INTERNAL = nedostatek paměti). */
+static int16_t prep_mknode(struct mock *m, const struct kivfs_dbb_write *w, struct prep *p)
+{
+    char parent_path[KIVFS_PATH_MAX + 1];
+    const char *name;
+
+    if (kivfs_path_split(w->path, parent_path, &name) != KIVFS_OK)
+        return KIVFS_STATUS_EXISTS;              /* "/" existuje vždy */
+    int16_t st = lookup(m, parent_path, &p->dir);
     if (st != KIVFS_STATUS_OK)
         return st;
-    if (!is_dir(n))
+    if (!is_dir(p->dir))
         return KIVFS_STATUS_NOT_DIR;
-    if (n->nkids > 0)
-        return KIVFS_STATUS_NOT_EMPTY;
+    long i = find_kid(p->dir, name, strlen(name));
+    if (i >= 0)
+        return KIVFS_STATUS_EXISTS;
+    p->pos = (size_t)(-i - 1);
 
-    struct node *dir = n->parent;
-    long i = find_kid(dir, n->name, strlen(n->name));
-    size_t pos = (size_t)i;                      /* existuje – našli jsme ho */
-    memmove(&dir->kids[pos], &dir->kids[pos + 1], (dir->nkids - pos - 1) * sizeof *dir->kids);
+    if (reserve_kid(p->dir) != 0)
+        return KIVFS_STATUS_INTERNAL;
+    struct node *n = calloc(1, sizeof *n);
+    if (n == NULL || (n->name = malloc(strlen(name) + 1)) == NULL) {
+        free(n);
+        return KIVFS_STATUS_INTERNAL;
+    }
+    strcpy(n->name, name);
+    n->parent     = p->dir;
+    n->a.id       = w->new_id;
+    n->a.mode     = w->mode;
+    n->a.uid      = w->uid;
+    n->a.gid      = w->gid;
+    n->a.size     = 0;
+    n->a.mtime_ms = w->time_ms;
+    n->a.ctime_ms = w->time_ms;
+    p->n = n;
+    return KIVFS_STATUS_OK;
+}
+
+static void do_mknode(const struct prep *p, uint64_t time_ms)
+{
+    struct node *dir = p->dir;
+    memmove(&dir->kids[p->pos + 1], &dir->kids[p->pos], (dir->nkids - p->pos) * sizeof *dir->kids);
+    dir->kids[p->pos] = p->n;
+    dir->nkids++;
+    dir->a.mtime_ms = time_ms;                   /* obsah adresáře se změnil */
+}
+
+/* RMNODE: jen podmínky (mazání nic nealokuje). */
+static int16_t prep_rmnode(struct mock *m, const struct kivfs_dbb_write *w, struct prep *p)
+{
+    if (strcmp(w->path, "/") == 0)
+        return KIVFS_STATUS_ACCESS_DENIED;
+    int16_t st = lookup(m, w->path, &p->n);
+    if (st != KIVFS_STATUS_OK)
+        return st;
+    if (!is_dir(p->n))
+        return KIVFS_STATUS_NOT_DIR;
+    if (p->n->nkids > 0)
+        return KIVFS_STATUS_NOT_EMPTY;
+    p->dir = p->n->parent;
+    p->pos = (size_t)find_kid(p->dir, p->n->name, strlen(p->n->name));   /* existuje */
+    return KIVFS_STATUS_OK;
+}
+
+static void do_rmnode(const struct prep *p, uint64_t time_ms)
+{
+    struct node *dir = p->dir;
+    memmove(&dir->kids[p->pos], &dir->kids[p->pos + 1],
+            (dir->nkids - p->pos - 1) * sizeof *dir->kids);
     dir->nkids--;
-    dir->a.mtime_ms = now_ms;
-    free_node(n);
+    dir->a.mtime_ms = time_ms;
+    free_node(p->n);
+}
+
+static int16_t mock_apply(struct kivfs_dbb *b, const struct kivfs_dbb_write *w,
+                          const struct kivfs_dbb_logrec *log, struct kivfs_attr *out)
+{
+    struct mock *m = (struct mock *)b;
+    struct prep p = { 0 };
+    int16_t st;
+
+    if (log->index != (uint64_t)m->nlog + 1)
+        return KIVFS_STATUS_INTERNAL;            /* díra / duplicita */
+    if ((w->kind == KIVFS_DBB_W_MKNODE || w->kind == KIVFS_DBB_W_RMNODE) && w->path == NULL)
+        return KIVFS_STATUS_INTERNAL;            /* chyba volajícího */
+
+    /* 1) archiv: místo + kopie operace */
+    if (m->nlog == m->caplog) {
+        size_t cap = m->caplog ? m->caplog * 2 : 64;
+        struct logent *l = realloc(m->log, cap * sizeof *l);
+        if (l == NULL)
+            return KIVFS_STATUS_INTERNAL;
+        m->log = l;
+        m->caplog = cap;
+    }
+    uint8_t *copy = malloc(log->dbop_len ? log->dbop_len : 1);
+    if (copy == NULL)
+        return KIVFS_STATUS_INTERNAL;
+    if (log->dbop_len)
+        memcpy(copy, log->dbop, log->dbop_len);
+
+    /* 2) podmínky + příprava stromu */
+    switch (w->kind) {
+    case KIVFS_DBB_W_MKNODE: st = prep_mknode(m, w, &p); break;
+    case KIVFS_DBB_W_RMNODE: st = prep_rmnode(m, w, &p); break;
+    default:                 st = KIVFS_STATUS_MALFORMED; break;
+    }
+    if (st == KIVFS_STATUS_INTERNAL) {
+        free(copy);
+        return st;
+    }
+
+    /* 3) provedení – odtud nic nesmí selhat */
+    if (st == KIVFS_STATUS_OK) {
+        if (w->kind == KIVFS_DBB_W_MKNODE) {
+            do_mknode(&p, w->time_ms);
+            if (out != NULL)
+                *out = p.n->a;
+        } else {
+            do_rmnode(&p, w->time_ms);
+        }
+    }
+    m->log[m->nlog++] = (struct logent){ log->t, log->op, st, copy, log->dbop_len };
+    return st;
+}
+
+/* ------------------------------------------------------------------ */
+/* Archiv                                                              */
+/* ------------------------------------------------------------------ */
+
+static void fill_rec(const struct mock *m, size_t i, struct kivfs_dbb_logrec *r)
+{
+    const struct logent *e = &m->log[i];
+    r->index    = (uint64_t)i + 1;
+    r->t        = e->t;
+    r->op       = e->op;
+    r->status   = e->status;
+    r->dbop     = e->dbop;
+    r->dbop_len = e->dbop_len;
+}
+
+static int16_t mock_log_head(struct kivfs_dbb *b, struct kivfs_dbb_logrec *last)
+{
+    struct mock *m = (struct mock *)b;
+    memset(last, 0, sizeof *last);
+    if (m->nlog > 0)
+        fill_rec(m, m->nlog - 1, last);
+    return KIVFS_STATUS_OK;
+}
+
+static int16_t mock_log_read(struct kivfs_dbb *b, uint64_t from, uint32_t max,
+                             int (*emit)(void *ud, const struct kivfs_dbb_logrec *r),
+                             void *ud)
+{
+    struct mock *m = (struct mock *)b;
+    struct kivfs_dbb_logrec r;
+    if (from == 0)
+        from = 1;
+    for (uint64_t i = from - 1; i < m->nlog && max > 0; i++, max--) {
+        fill_rec(m, (size_t)i, &r);
+        if (emit(ud, &r) != 0)
+            break;
+    }
     return KIVFS_STATUS_OK;
 }
 
@@ -195,15 +325,19 @@ static void mock_close(struct kivfs_dbb *b)
     if (m == NULL)
         return;
     free_node(m->root);
+    for (size_t i = 0; i < m->nlog; i++)
+        free(m->log[i].dbop);
+    free(m->log);
     free(m);
 }
 
 static const struct kivfs_dbb_ops g_mock_ops = {
-    .get    = mock_get,
-    .mknode = mock_mknode,
-    .list   = mock_list,
-    .rmnode = mock_rmnode,
-    .close  = mock_close,
+    .get      = mock_get,
+    .list     = mock_list,
+    .apply    = mock_apply,
+    .log_head = mock_log_head,
+    .log_read = mock_log_read,
+    .close    = mock_close,
 };
 
 int kivfs_dbb_mock_open(struct kivfs_dbb **out)
@@ -217,9 +351,8 @@ int kivfs_dbb_mock_open(struct kivfs_dbb **out)
         return KIVFS_ENOMEM;
     }
     m->base.ops     = &g_mock_ops;
-    m->root->a.id   = 1;                         /* viz backend.h */
+    m->root->a.id   = KIVFS_DB_ROOT_ID;          /* viz backend.h */
     m->root->a.mode = KIVFS_MODE_DIR | 0777;
-    m->next_id      = 2;
     *out = &m->base;
     return KIVFS_OK;
 }

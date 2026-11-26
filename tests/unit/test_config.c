@@ -197,8 +197,11 @@ static void test_modconf_ok(void)
     CHECK(modconf_text(CLUSTER MODULES, KIVFS_MOD_AUTH, NULL, &mc) == KIVFS_OK);
     CHECK(mc.has_dep[KIVFS_MOD_SYNC] && !mc.has_dep[KIVFS_MOD_VFS]);
     CHECK(modconf_text(CLUSTER MODULES, KIVFS_MOD_SYNC, NULL, &mc) == KIVFS_OK);
-    CHECK(mc.has_dep[KIVFS_MOD_VFS] && !mc.has_dep[KIVFS_MOD_DB]);
+    CHECK(mc.has_dep[KIVFS_MOD_VFS] && mc.has_dep[KIVFS_MOD_DB] && !mc.has_dep[KIVFS_MOD_SYNC]);
     CHECK(modconf_text(CLUSTER MODULES, KIVFS_MOD_DB, NULL, &mc) == KIVFS_OK);
+    for (int m = 0; m < KIVFS_MOD_COUNT; m++)
+        CHECK(mc.has_dep[m] == (m == KIVFS_MOD_SYNC));      /* DB -> SYNC (SUBMIT) */
+    CHECK(modconf_text(CLUSTER MODULES, KIVFS_MOD_FS, NULL, &mc) == KIVFS_OK);
     for (int m = 0; m < KIVFS_MOD_COUNT; m++)
         CHECK(!mc.has_dep[m]);
 
@@ -242,13 +245,15 @@ static void test_modconf_errors(void)
     /* chybějící věci */
     rc = modconf_text(CLUSTER "[sync]\nip = s\nport = 2\n", KIVFS_MOD_DB, NULL, &mc);
     EXPECT_ERR(rc, "", "chybí sekce [db]");
+    rc = modconf_text(CLUSTER "[db]\nip = d\nport = 4\n", KIVFS_MOD_DB, NULL, &mc);
+    EXPECT_ERR(rc, "", "chybí sekce [sync]");  /* DB volá Sync (SUBMIT) */
     rc = modconf_text(CLUSTER "[sync]\nport = 2\n[vfs]\nip=v\nport=3\n", KIVFS_MOD_SYNC, NULL, &mc);
     EXPECT_ERR(rc, ":6:", "'ip'");
-    rc = modconf_text("[db]\nip = d\nport = 4\n", KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text("[fs]\nip = d\nport = 4\n", KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, "", "[cluster]");
-    rc = modconf_text("[cluster]\nnode1 = a:1\n[db]\nip = d\nport = 4\n", KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text("[cluster]\nnode1 = a:1\n[fs]\nip = d\nport = 4\n", KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, ":1:", "'local'");
-    rc = modconf_text("[cluster]\nlocal = node1\n[db]\nip = d\nport = 4\n", KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text("[cluster]\nlocal = node1\n[fs]\nip = d\nport = 4\n", KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, ":1:", "žádný uzel");
 
     /* špatné hodnoty */
@@ -258,30 +263,30 @@ static void test_modconf_errors(void)
     rc = modconf_text(CLUSTER "[sync]\nip = s\nport = 2x\n[vfs]\nip=v\nport=3\n",
                       KIVFS_MOD_SYNC, NULL, &mc);
     EXPECT_ERR(rc, ":8:", "není číslo");
-    rc = modconf_text(CLUSTER "[db]\nip = d\nport = 4\nmax_conns = -1\n", KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text(CLUSTER "[fs]\nip = d\nport = 4\nmax_conns = -1\n", KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, ":9:", "max_conns");
 
     /* uzly */
-    rc = modconf_text("[cluster]\nlocal = node4\nnode1 = a:1\n[db]\nip=d\nport=4\n",
-                      KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text("[cluster]\nlocal = node4\nnode1 = a:1\n[fs]\nip=d\nport=4\n",
+                      KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, ":2:", "node4");
-    rc = modconf_text("[cluster]\nlocal = node1\nnode0 = a:1\n[db]\nip=d\nport=4\n",
-                      KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text("[cluster]\nlocal = node1\nnode0 = a:1\n[fs]\nip=d\nport=4\n",
+                      KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, ":3:", "node0");
-    rc = modconf_text("[cluster]\nlocal = node1\nnode1 = a:1\nnode01 = b:1\n[db]\nip=d\nport=4\n",
-                      KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text("[cluster]\nlocal = node1\nnode1 = a:1\nnode01 = b:1\n[fs]\nip=d\nport=4\n",
+                      KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, ":4:", "node01");
-    rc = modconf_text("[cluster]\nlocal = node1\nnodes = a\n[db]\nip=d\nport=4\n",
-                      KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text("[cluster]\nlocal = node1\nnodes = a\n[fs]\nip=d\nport=4\n",
+                      KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, ":3:", "neznámý klíč 'nodes'");
-    rc = modconf_text("[cluster]\nlocal = node1\nnode1 = a\n[db]\nip=d\nport=4\n",
-                      KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text("[cluster]\nlocal = node1\nnode1 = a\n[fs]\nip=d\nport=4\n",
+                      KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, ":3:", "chybí port");      /* bez portu a bez [sync] */
-    rc = modconf_text("[cluster]\nlocal = node1\nnode1 = ::1:5\n[db]\nip=d\nport=4\n",
-                      KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text("[cluster]\nlocal = node1\nnode1 = ::1:5\n[fs]\nip=d\nport=4\n",
+                      KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, ":3:", "IPv6");
-    rc = modconf_text("[cluster]\nlocal = node1\nnode1 = a:0\n[db]\nip=d\nport=4\n",
-                      KIVFS_MOD_DB, NULL, &mc);
+    rc = modconf_text("[cluster]\nlocal = node1\nnode1 = a:0\n[fs]\nip=d\nport=4\n",
+                      KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, ":3:", "neplatná adresa");
 
     char many[4096] = "[cluster]\nlocal = node1\n";
@@ -290,8 +295,8 @@ static void test_modconf_errors(void)
         snprintf(l, sizeof l, "node%d = h%d:1\n", i, i);
         strcat(many, l);
     }
-    strcat(many, "[db]\nip=d\nport=4\n");
-    rc = modconf_text(many, KIVFS_MOD_DB, NULL, &mc);
+    strcat(many, "[fs]\nip=d\nport=4\n");
+    rc = modconf_text(many, KIVFS_MOD_FS, NULL, &mc);
     EXPECT_ERR(rc, "", "uzlů");
 
     CHECK(modconf_text(CLUSTER MODULES, KIVFS_MOD_CLIENT, NULL, &mc) == KIVFS_EINVAL);
@@ -303,7 +308,7 @@ static void test_templates(void)
     static const char *files[] = {
         "3nodes/node1.ini", "3nodes/node2.ini", "3nodes/node3.ini",
         "local/node1.ini", "local/node2.ini", "local/node3.ini",
-        "examples/split-node1.ini",
+        "single/node1.ini", "examples/split-node1.ini",
     };
     for (size_t f = 0; f < sizeof files / sizeof files[0]; f++) {
         char path[512];
@@ -314,27 +319,52 @@ static void test_templates(void)
         if (rc != KIVFS_OK) { fprintf(stderr, "     %s\n", g_err); continue; }
         for (int m = KIVFS_MOD_AUTH; m < KIVFS_MOD_COUNT; m++) {
             struct kivfs_modconf mc;
-            rc = kivfs_modconf_from(c, (enum kivfs_module)m, NULL, &mc, g_err, sizeof g_err);
+            /* klíče navíc jako v main.c modulů (Sync: order_cli, DB: backend) */
+            static const char *const sync_keys[] = { "order_cli", NULL };
+            static const char *const db_keys[]   = { "backend", NULL };
+            const char *const *extra = m == KIVFS_MOD_SYNC ? sync_keys
+                                     : m == KIVFS_MOD_DB   ? db_keys : NULL;
+            rc = kivfs_modconf_from(c, (enum kivfs_module)m, extra, &mc, g_err, sizeof g_err);
             CHECK(rc == KIVFS_OK);
             if (rc != KIVFS_OK)
                 fprintf(stderr, "     %s (%s): %s\n", files[f], kivfs_module_name(m), g_err);
-            CHECK(mc.node_count == 3);
+            CHECK(mc.node_count == (strncmp(files[f], "single/", 7) == 0 ? 1u : 3u));
         }
         kivfs_config_free(c);
     }
 
-    /* lokální šablona: node2 má porty 320xx, nodeN nesou porty */
+    /* lokální šablona: node2 má porty 311xx, nodeN nesou porty */
     struct kivfs_config *c;
     struct kivfs_modconf mc;
     char path[512];
     snprintf(path, sizeof path, "%s/conf/local/node2.ini", KIVFS_SOURCE_DIR);
     if (kivfs_config_load(path, &c, g_err, sizeof g_err) == KIVFS_OK) {
         CHECK(kivfs_modconf_from(c, KIVFS_MOD_SYNC, NULL, &mc, g_err, sizeof g_err) == KIVFS_OK);
-        CHECK(mc.local_node == 2 && mc.advertise.port == 32002);
-        CHECK(mc.deps[KIVFS_MOD_VFS].port == 32003);
-        CHECK(kivfs_modconf_node(&mc, 3)->sync.port == 33002);
+        CHECK(mc.local_node == 2 && mc.advertise.port == 31102);
+        CHECK(mc.deps[KIVFS_MOD_VFS].port == 31103);
+        CHECK(kivfs_modconf_node(&mc, 3)->sync.port == 31202);
         kivfs_config_free(c);
     }
+}
+
+/* [cluster] op_timeout_ms: výchozí, vlastní, mimo rozsah. */
+static void test_op_timeout(void)
+{
+    struct kivfs_modconf mc;
+    int rc = modconf_text(CLUSTER MODULES, KIVFS_MOD_AUTH, NULL, &mc);
+    CHECK(rc == KIVFS_OK && mc.op_timeout_ms == KIVFS_OP_TIMEOUT_DEFAULT_MS);
+
+    rc = modconf_text("[cluster]\nop_timeout_ms = 1500\nlocal = node1\nnode1 = a\n" MODULES,
+                      KIVFS_MOD_SYNC, NULL, &mc);
+    CHECK(rc == KIVFS_OK && mc.op_timeout_ms == 1500);
+    if (rc != KIVFS_OK) fprintf(stderr, "     %s\n", g_err);
+
+    rc = modconf_text("[cluster]\nop_timeout_ms = 10\nlocal = node1\nnode1 = a\n" MODULES,
+                      KIVFS_MOD_SYNC, NULL, &mc);
+    EXPECT_ERR(rc, ":2:", "op_timeout_ms");
+    rc = modconf_text("[cluster]\nlocal = node1\nnode1 = a\nop_timeout_ms = x\n" MODULES,
+                      KIVFS_MOD_SYNC, NULL, &mc);
+    EXPECT_ERR(rc, ":4:", "op_timeout_ms");
 }
 
 int main(void)
@@ -344,6 +374,7 @@ int main(void)
     test_modconf_ok();
     test_modconf_errors();
     test_templates();
+    test_op_timeout();
     printf("config: %d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

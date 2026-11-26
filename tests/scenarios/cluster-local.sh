@@ -6,7 +6,7 @@
 # Použití:  tests/scenarios/cluster-local.sh <adresář s binárkami> [adresář conf/local]
 #
 # 1. spustí 15 procesů (3 uzly × auth, sync, vfs, db, fs)
-# 2. kivfs-check --wait: vše se musí propojit (15 modulů, 18 spojení)
+# 2. kivfs-check --wait: vše se musí propojit (15 modulů, 24 spojení)
 # 3. VÝPADEK: zastaví Sync uzlu node2 -> kivfs-check musí hlásit chybu
 # 4. OBNOVA: spustí ho znovu -> vše se musí znovu propojit a ostatní
 #    Synce musí v logu poznat restart (nová inkarnace)

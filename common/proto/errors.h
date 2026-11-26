@@ -83,6 +83,11 @@ enum kivfs_err {
     KIVFS_ENOTREADY   = -42,  /* Modul, který chci volat, teď není
                                * připojený (linka dole) – odpovědět
                                * protistraně KIVFS_STATUS_UNAVAILABLE. */
+    KIVFS_ENOENT      = -43,  /* Hledaná položka (např. operace podle op_id
+                               * ve frontě Syncu) neexistuje. */
+    KIVFS_EPROTO      = -44,  /* Protistrana porušila protokol (např. COMMIT
+                               * s časem menším než návrh) – zalogovat,
+                               * odpovědět INTERNAL. */
 
     /* ---- konfigurace ---- */
     KIVFS_ECONFIG     = -60   /* Chybná konfigurace (syntaxe, chybějící nebo

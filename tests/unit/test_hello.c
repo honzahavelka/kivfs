@@ -64,12 +64,54 @@ static void test_may_call(void)
     expect[KIVFS_MOD_AUTH][KIVFS_MOD_SYNC] = 1;
     expect[KIVFS_MOD_SYNC][KIVFS_MOD_VFS] = 1;
     expect[KIVFS_MOD_SYNC][KIVFS_MOD_SYNC] = 1;
+    expect[KIVFS_MOD_SYNC][KIVFS_MOD_DB] = 1;
     expect[KIVFS_MOD_VFS][KIVFS_MOD_DB] = 1;
     expect[KIVFS_MOD_VFS][KIVFS_MOD_FS] = 1;
+    expect[KIVFS_MOD_DB][KIVFS_MOD_SYNC] = 1;
     for (int a = 0; a < KIVFS_MOD_COUNT; a++)
         for (int b = 0; b < KIVFS_MOD_COUNT; b++)
             CHECK(kivfs_module_may_call((uint32_t)a, (uint32_t)b) == expect[a][b]);
     CHECK(!kivfs_module_may_call(99, KIVFS_MOD_AUTH));
+}
+
+/* Strom STATUS: přesně Auth -> Sync -> VFS -> DB, FS; podmnožina may_call,
+ * každý serverový modul kromě Auth má právě jednoho rodiče, z Auth se
+ * po stromu dojde ke všem modulům (tj. bez cyklu). */
+static void test_status_tree(void)
+{
+    int expect[KIVFS_MOD_COUNT][KIVFS_MOD_COUNT];
+    memset(expect, 0, sizeof expect);
+    expect[KIVFS_MOD_AUTH][KIVFS_MOD_SYNC] = 1;
+    expect[KIVFS_MOD_SYNC][KIVFS_MOD_VFS] = 1;
+    expect[KIVFS_MOD_VFS][KIVFS_MOD_DB] = 1;
+    expect[KIVFS_MOD_VFS][KIVFS_MOD_FS] = 1;
+    for (int a = 0; a < KIVFS_MOD_COUNT; a++)
+        for (int b = 0; b < KIVFS_MOD_COUNT; b++) {
+            int t = kivfs_module_status_child((uint32_t)a, (uint32_t)b);
+            CHECK(t == expect[a][b]);
+            if (t)
+                CHECK(kivfs_module_may_call((uint32_t)a, (uint32_t)b));
+        }
+    for (int b = KIVFS_MOD_AUTH; b < KIVFS_MOD_COUNT; b++) {
+        int parents = 0;
+        for (int a = 0; a < KIVFS_MOD_COUNT; a++)
+            parents += kivfs_module_status_child((uint32_t)a, (uint32_t)b);
+        CHECK(parents == (b == KIVFS_MOD_AUTH ? 0 : 1));
+    }
+    /* průchod z Auth: každý modul navštíven nejvýš jednou, všechny dosaženy */
+    int seen[KIVFS_MOD_COUNT] = { 0 }, stack[KIVFS_MOD_COUNT * KIVFS_MOD_COUNT], sp = 0;
+    stack[sp++] = KIVFS_MOD_AUTH;
+    while (sp > 0) {
+        int a = stack[--sp];
+        CHECK(seen[a] == 0);
+        seen[a]++;
+        for (int b = 0; b < KIVFS_MOD_COUNT; b++)
+            if (kivfs_module_status_child((uint32_t)a, (uint32_t)b) && seen[b] == 0)
+                stack[sp++] = b;
+    }
+    for (int b = KIVFS_MOD_AUTH; b < KIVFS_MOD_COUNT; b++)
+        CHECK(seen[b] == 1);
+    CHECK(!kivfs_module_status_child(99, KIVFS_MOD_SYNC));
 }
 
 static void test_hash_and_incarnation(void)
@@ -139,6 +181,7 @@ int main(void)
 {
     test_roundtrip();
     test_may_call();
+    test_status_tree();
     test_hash_and_incarnation();
     test_diag();
     printf("hello: %d checks, %d failed\n", g_checks, g_failed);

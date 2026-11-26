@@ -76,6 +76,13 @@ struct kivfs_node_addr {
     struct kivfs_endpoint sync;      /* Sync modul uzlu */
 };
 
+/* [cluster] op_timeout_ms: časový rámec jedné operace klienta (originál
+ * 7.4.3: direktiva Timeout, výchozí 30 s). Je v [cluster], protože ho
+ * potřebují Auth i Sync. Odvozené timeouty: viz sync/sync.h. */
+#define KIVFS_OP_TIMEOUT_DEFAULT_MS 30000
+#define KIVFS_OP_TIMEOUT_MIN_MS     400
+#define KIVFS_OP_TIMEOUT_MAX_MS     600000
+
 struct kivfs_modconf {
     enum kivfs_module     self;
     uint32_t              local_node;
@@ -93,6 +100,7 @@ struct kivfs_modconf {
     uint32_t              max_pending;              /* 0 = výchozí reactoru */
     int                   connect_timeout_ms;       /* 0 = výchozí reactoru */
     int                   rx_timeout_ms;
+    int                   op_timeout_ms;            /* [cluster] op_timeout_ms */
 };
 
 /* Sestaví pohled modulu self z načtené konfigurace a zvaliduje ji.

@@ -59,19 +59,22 @@ projektu – nepoužívat, má v cache jinou konfiguraci.)
 ctest --test-dir build --output-on-failure
 ```
 
-Co se spustí (celkem 13 testů, ~8 s; na konci `100% tests passed`):
+Co se spustí (celkem 16 testů, ~15 s; na konci `100% tests passed`):
 
 | Test | Co ověřuje | Doba |
 |---|---|---|
 | `protocol`, `channel`, `queue` | formát paketů, blokující kanál, fronta mezi vlákny | < 1 s |
 | `hello` | HELLO a bloky STATUS (bez sítě) | okamžitě |
 | `fsproto` | attr/entry/ctx na drátě, pravidla cesty | okamžitě |
+| `syncproto` | zprávy Syncu na drátě (sync_hdr, dbop, arch_hdr…), přenos DB operace | okamžitě |
+| `lane` | pruh Syncu: Lamportovy hodiny, seřazená fronta, stabilita + simulace hlasování 3 uzlů (300 náhodných běhů) | < 1 s |
 | `db_mock` | strom metadat v paměti (EXISTS, NOT_EMPTY, řazení, 2000 položek) | okamžitě |
 | `vfs_perm` | kontrola práv rwx | okamžitě |
-| `config` | INI parser, validace, všechny šablony v `conf/` | okamžitě |
+| `config` | INI parser, validace, všechny šablony v `conf/`, `op_timeout_ms` | okamžitě |
 | `reactor`, `reactor_out`, `events` | epoll reactor, odchozí spojení, timeouty, fronta událostí | ~1 s každý |
 | `cluster_local` | **scénář**: 3 uzly × 5 modulů na jednom stroji se propojí; výpadek a obnova Syncu | ~2 s |
-| `fs_local` | **scénář**: mkdir/ls/stat/rmdir přes klienta, chyby, výpadek a obnova DB | ~1 s |
+| `fs_local` | **scénář**: mkdir/ls/stat/rmdir přes klienta (cluster s 1 uzlem, `conf/single`), chyby, výpadek a obnova DB | ~1 s |
+| `sync_local` | **scénář**: kolo hlasování na 3 uzlech – souběh 3 klientů, výpadek / obnova / zamrznutí (SIGSTOP) Syncu | ~6 s |
 
 Užitečné varianty:
 
@@ -86,6 +89,7 @@ Scénáře lze pustit i přímo (hezčí výstup, vypíší adresář s logy pro
 ```sh
 tests/scenarios/fs-local.sh build
 tests/scenarios/cluster-local.sh build
+tests/scenarios/sync-local.sh build
 ```
 
 Výsledek je na posledním řádku: `SCÉNÁŘ OK`, nebo `SCÉNÁŘ SELHAL` + řádky
@@ -113,11 +117,14 @@ Valgrind je v obrazu také: `valgrind --leak-check=full build/test_db_mock`.
 
 ### A6. Ruční zkoušení – jeden uzel a klient
 
-V kontejneru spusť 5 modulů uzlu node1 na pozadí (logy do souboru):
+V kontejneru spusť 5 modulů uzlu node1 na pozadí (logy do souboru).
+Konfigurace `conf/single/` je cluster s jediným uzlem: Sync hlasuje
+sám se sebou, takže operace projdou i bez ostatních uzlů (s
+`conf/local/node1.ini` by bez node2 a node3 zápisy končily UNAVAILABLE):
 
 ```sh
 for m in auth sync vfs db fs; do
-    build/kivfs-$m -c conf/local/node1.ini 2>>/tmp/node1.log &
+    build/kivfs-$m -c conf/single/node1.ini 2>>/tmp/node1.log &
 done
 ```
 
@@ -158,7 +165,7 @@ Výpadek a obnova – např. zastavit DB a zkusit operaci:
 ```sh
 pkill -f 'kivfs-db '                       # zastavit DB
 printf 'ls /\nquit\n' | build/kivfs-client 127.0.0.1 31001   # -> UNAVAILABLE
-build/kivfs-db -c conf/local/node1.ini 2>>/tmp/node1.log &   # znovu spustit
+build/kivfs-db -c conf/single/node1.ini 2>>/tmp/node1.log &  # znovu spustit
 ```
 
 Po restartu je mock DB prázdná (data drží jen v paměti) – to je zatím záměr.
@@ -181,11 +188,11 @@ build/kivfs-check -c conf/local/node1.ini -c conf/local/node2.ini \
 ```
 
 `kivfs-check` vypíše tabulku modulů a spojení a na konci
-`VÝSLEDEK: moduly 15/15, spojení 18/18 – OK`.
+`VÝSLEDEK: moduly 15/15, spojení 24/24 – OK`.
 
-Porty v `conf/local`: node1 = 310xx, node2 = 320xx, node3 = 330xx
+Porty v `conf/local`: node1 = 310xx, node2 = 311xx, node3 = 312xx
 (Auth = …01, Sync …02, VFS …03, DB …04, FS …05). Klient na node2:
-`build/kivfs-client 127.0.0.1 32001`.
+`build/kivfs-client 127.0.0.1 31101`.
 
 Pozor: **uzly zatím nesdílejí metadata** – `mkdir` na node1 na node2 neuvidíš.
 To přijde se Syncem.

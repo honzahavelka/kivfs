@@ -3,7 +3,7 @@
 # KIVFS – scénář "operace souborového systému na jednom uzlu"
 # ===========================================================
 #
-# Použití:  tests/scenarios/fs-local.sh <adresář s binárkami> [conf/local/node1.ini]
+# Použití:  tests/scenarios/fs-local.sh <adresář s binárkami> [conf/single/node1.ini]
 #
 # Spustí 5 modulů uzlu node1 a přes kivfs-client (klient -> Auth -> Sync
 # -> VFS -> DB) ověří:
@@ -16,7 +16,7 @@
 set -u
 
 BIN=${1:?použití: $0 <adresář s binárkami> [node1.ini]}
-CFG=${2:-$(cd "$(dirname "$0")/../.." && pwd)/conf/local/node1.ini}
+CFG=${2:-$(cd "$(dirname "$0")/../.." && pwd)/conf/single/node1.ini}
 PORT=$(awk '/^\[auth\]/{a=1;next} /^\[/{a=0} a && $1=="port"{print $3}' "$CFG")
 LOGS=$(mktemp -d /tmp/kivfs-fs.XXXXXX)
 declare -A PID

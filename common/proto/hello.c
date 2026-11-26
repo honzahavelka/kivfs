@@ -76,9 +76,21 @@ int kivfs_module_may_call(uint32_t caller, uint32_t callee)
     switch (caller) {
     case KIVFS_MOD_CLIENT: return callee == KIVFS_MOD_AUTH;
     case KIVFS_MOD_AUTH:   return callee == KIVFS_MOD_SYNC;
-    case KIVFS_MOD_SYNC:   return callee == KIVFS_MOD_VFS || callee == KIVFS_MOD_SYNC;
+    case KIVFS_MOD_SYNC:   return callee == KIVFS_MOD_VFS || callee == KIVFS_MOD_DB
+                                  || callee == KIVFS_MOD_SYNC;
     case KIVFS_MOD_VFS:    return callee == KIVFS_MOD_DB || callee == KIVFS_MOD_FS;
+    case KIVFS_MOD_DB:     return callee == KIVFS_MOD_SYNC;
     default:               return 0;
+    }
+}
+
+int kivfs_module_status_child(uint32_t parent, uint32_t child)
+{
+    switch (parent) {
+    case KIVFS_MOD_AUTH: return child == KIVFS_MOD_SYNC;
+    case KIVFS_MOD_SYNC: return child == KIVFS_MOD_VFS;
+    case KIVFS_MOD_VFS:  return child == KIVFS_MOD_DB || child == KIVFS_MOD_FS;
+    default:             return 0;
     }
 }
 

@@ -10,7 +10,9 @@
  * pěti modulů uzlu. Pak porovná, co moduly hlásí, s tím, co má podle
  * konfigurace platit:
  *   - každý uzel: odpovědělo všech 5 modulů
- *   - každý uzel: auth->sync, sync->vfs, vfs->db, vfs->fs jsou UP
+ *   - každý uzel: všechny linky mezi moduly uzlu podle
+ *     kivfs_module_may_call jsou UP (auth->sync, sync->vfs, sync->db,
+ *     vfs->db, vfs->fs, db->sync)
  *   - každý pár uzlů: sync->sync jsou UP
  *   - obě strany se shodnou: volaný modul má volajícího v seznamu
  *     příchozích a volající zná jeho aktuální inkarnaci
@@ -233,11 +235,14 @@ static int evaluate(int print)
                 printf("  %-5s neodpověděl\n", mname((uint32_t)m));
             }
         }
-        links_total += 4;
-        links_ok += check_link(KIVFS_MOD_AUTH, id, KIVFS_MOD_SYNC, id, print);
-        links_ok += check_link(KIVFS_MOD_SYNC, id, KIVFS_MOD_VFS, id, print);
-        links_ok += check_link(KIVFS_MOD_VFS, id, KIVFS_MOD_DB, id, print);
-        links_ok += check_link(KIVFS_MOD_VFS, id, KIVFS_MOD_FS, id, print);
+        /* linky uzlu odvozené z may_call (jako kostra v modconf.c) */
+        for (int a = KIVFS_MOD_AUTH; a < KIVFS_MOD_COUNT; a++)
+            for (int b = KIVFS_MOD_AUTH; b < KIVFS_MOD_COUNT; b++) {
+                if (a == b || !kivfs_module_may_call((uint32_t)a, (uint32_t)b))
+                    continue;
+                links_total++;
+                links_ok += check_link((uint32_t)a, id, (uint32_t)b, id, print);
+            }
         for (int j = 0; j < g_n; j++) {
             uint32_t other = g_nodes[j].mc.local_node;
             if (other == id)

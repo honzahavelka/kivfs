@@ -41,6 +41,14 @@ struct kivfs_mod_peer {
     uint64_t      incarnation;
 };
 
+/* Událost protistrany pro on_peer. */
+enum kivfs_peer_event {
+    KIVFS_PEER_LINK_UP   = 1,   /* MOJE odchozí linka na (module, node) prošla HELLO */
+    KIVFS_PEER_LINK_DOWN = 2,   /* moje odchozí linka spadla (byla UP) */
+    KIVFS_PEER_IN_UP     = 3,   /* protistrana se ke mně připojila (prošla HELLO) */
+    KIVFS_PEER_IN_DOWN   = 4    /* její příchozí spojení se zavřelo */
+};
+
 struct kivfs_mod_ops {
     enum kivfs_module  self;
     const char *const *extra_keys;   /* klíče navíc v sekci modulu, NULL-terminated */
@@ -59,6 +67,15 @@ struct kivfs_mod_ops {
      * 0 = neznám -> kostra odpoví UNKNOWN_REQ. NULL = žádné. */
     int  (*on_request)(struct kivfs_mod *m, const struct kivfs_mod_peer *from,
                        struct kivfs_packet *req);
+
+    /* Změna spojení s jiným SERVEROVÝM modulem (klienti
+     * se nehlásí). Ve workeru, po aktualizaci tabulek kostry (při LINK_UP
+     * už kivfs_mod_call_node funguje). incarnation = z HELLO protistrany
+     * (u *_DOWN poslední známá). Restart protistrany modul pozná sám:
+     * UP s jinou incarnation, než viděl naposledy (kostra to také
+     * zaloguje). Při ukončování modulu (SHUTDOWN) se nevolá. NULL = nic. */
+    void (*on_peer)(struct kivfs_mod *m, uint32_t module, uint32_t node,
+                    enum kivfs_peer_event ev, uint64_t incarnation);
 };
 
 /* ------------------------------------------------------------------ */
@@ -71,6 +88,14 @@ const struct kivfs_modconf *kivfs_mod_conf(const struct kivfs_mod *m);
 
 /* Timestamp pro další odesílaný paket (čítač modulu). */
 uint64_t kivfs_mod_next_ts(struct kivfs_mod *m);
+/* Řádek do logu ve formátu kostry ("čas [nodeN modul] zpráva"). */
+void     kivfs_mod_log(const struct kivfs_mod *m, const char *fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 2, 3)))
+#endif
+    ;
+/* Inkarnace tohoto běhu modulu (posílá se v HELLO); platí už v init. */
+uint64_t kivfs_mod_incarnation(const struct kivfs_mod *m);
 
 /* Odpověď na příchozí požadavek (převezme resp vždy; mrtvé spojení ->
  * tiše zahozeno). */
@@ -91,6 +116,14 @@ void     kivfs_mod_reply_status(struct kivfs_mod *m, kivfs_conn_id to,
 typedef void (*kivfs_mod_cont)(struct kivfs_mod *m, void *state, int err,
                                struct kivfs_packet *resp);
 
+/* Jednorázový časovač: za delay_ms (>= 0) zavolá cb(m, state) ve workeru.
+ * Zrušit nejde – cb si sám ověří, jestli je ještě potřeba (state vlastní
+ * modul a musí žít do zavolání cb). Při ukončování modulu se cb už
+ * nezavolá (fini uklidí state). KIVFS_OK; KIVFS_EAGAIN (moc časovačů
+ * najednou); KIVFS_EINVAL (delay < 0, cb NULL). */
+typedef void (*kivfs_mod_timer_cb)(struct kivfs_mod *m, void *state);
+int      kivfs_mod_timer(struct kivfs_mod *m, int delay_ms, kivfs_mod_timer_cb cb, void *state);
+
 /* Pošle požadavek modulu "to" na STEJNÉM uzlu (musí to být moje
  * závislost, např. VFS -> DB) a vrátí se hned; výsledek dostane cont.
  * Paket převezme vždy; timestamp nastaví sama.
@@ -100,6 +133,18 @@ typedef void (*kivfs_mod_cont)(struct kivfs_mod *m, void *state, int err,
  *   KIVFS_EINVAL     "to" není moje závislost */
 int      kivfs_mod_call(struct kivfs_mod *m, enum kivfs_module to, struct kivfs_packet *req,
                         int timeout_ms, kivfs_mod_cont cont, void *state);
+
+/* Jako kivfs_mod_call, ale na Sync JINÉHO uzlu (jen
+ * pro modul Sync; linky na Synce všech uzlů z [cluster] kostra už drží).
+ * Požadavek jde po MOJÍ odchozí lince na daný uzel, takže zprávy jednomu
+ * uzlu dorazí v pořadí odeslání – ale jen v rámci jednoho spojení:
+ * po reconnectu se nic znovu neposílá (to si řeší volající).
+ * Vrací KIVFS_OK (cont právě jednou), jinak se cont NEvolá:
+ *   KIVFS_ENOTREADY  linka na uzel není UP
+ *   KIVFS_EAGAIN     moc rozpracovaných volání (sdílená tabulka s call)
+ *   KIVFS_EINVAL     nejsem Sync, node = já nebo uzel není v [cluster] */
+int      kivfs_mod_call_node(struct kivfs_mod *m, uint32_t node, struct kivfs_packet *req,
+                             int timeout_ms, kivfs_mod_cont cont, void *state);
 
 /* Přepošle požadavek modulu "to" a jeho odpověď vrátí původnímu odesílateli
  * (záznamy za ref se zkopírují, stav zůstane). Pro moduly, které jen

@@ -14,7 +14,6 @@
 
 #define MOCK_UID           1000u
 #define MOCK_GID           1000u
-#define SYNC_TIMEOUT_MS    4000     /* klient 5 s > Auth->Sync 4 s > Sync->VFS 3 s */
 
 static int is_client_op(uint16_t code)
 {
@@ -47,7 +46,9 @@ static int on_request(struct kivfs_mod *m, const struct kivfs_mod_peer *from,
                                                       : KIVFS_STATUS_INTERNAL);
         return 1;
     }
-    kivfs_mod_forward(m, from, req, &fwd, KIVFS_MOD_SYNC, SYNC_TIMEOUT_MS);
+    /* Auth -> Sync = celý časový rámec operace ([cluster] op_timeout_ms);
+     * Sync si své kroky odvodí kratší, ať odpověď stihne zpět */
+    kivfs_mod_forward(m, from, req, &fwd, KIVFS_MOD_SYNC, kivfs_mod_conf(m)->op_timeout_ms);
     return 1;
 }
 

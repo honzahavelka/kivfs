@@ -2,7 +2,11 @@
  * KIVFS – CLI klient (interaktivní)
  * =================================
  *
- * Použití:  kivfs-client <host> <port>
+ * Použití:  kivfs-client [-t <ms>] <host> <port>
+ *
+ *   -t  timeout odpovědi serveru (výchozí 35000 = výchozí [cluster]
+ *       op_timeout_ms 30 s + rezerva; musí být větší než op_timeout_ms
+ *       uzlu, jinak klient vzdá operaci, která ještě může doběhnout)
  *
  * Po startu se připojí k modulu Auth uzlu (klient smí JEN do Auth – viz
  * hello.h), pošle HELLO (klient = node_id 0, modul CLIENT) a pak čte
@@ -55,6 +59,7 @@
 #define LINE_MAX_LEN   (KIVFS_PATH_MAX + 64)   /* nejdelší cesta + příkaz; včetně '\n' a '\0' */
 #define MAX_ARGS       8
 #define PING_MAX_COUNT 1000
+#define CLIENT_TIMEOUT_DEFAULT_MS 35000
 
 /* Stav jednoho připojení klienta. ID serveru z HELLO je v ch.peer_node_id. */
 struct client {
@@ -505,13 +510,13 @@ static enum cmd_result cmd_help(struct client *c, int argc, char **argv)
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
-static int client_connect(struct client *c, const char *host, uint16_t port)
+static int client_connect(struct client *c, const char *host, uint16_t port, int timeout_ms)
 {
     kivfs_chan_init(&c->ch);
     c->clock = 0;
     c->incarnation = kivfs_incarnation_new();
 
-    int rc = kivfs_chan_open(&c->ch, host, port, KIVFS_CHAN_DEFAULT_TIMEOUT_MS);
+    int rc = kivfs_chan_open(&c->ch, host, port, timeout_ms);
     if (rc != KIVFS_OK) {
         int e = errno;
         char what[300];
@@ -585,9 +590,15 @@ static int repl(struct client *c)
 
 int main(int argc, char **argv)
 {
-    unsigned long port;
-    if (argc != 3 || parse_uint(argv[2], 1, 65535, &port) != 0) {
-        fprintf(stderr, "použití: %s <host> <port>\n", argv[0]);
+    unsigned long port, timeout = CLIENT_TIMEOUT_DEFAULT_MS;
+    int a = 1;
+    if (argc >= 3 && strcmp(argv[1], "-t") == 0) {
+        if (parse_uint(argv[2], 100, 3600000, &timeout) != 0)
+            argc = 0;                       /* -> použití */
+        a = 3;
+    }
+    if (argc - a != 2 || parse_uint(argv[a + 1], 1, 65535, &port) != 0) {
+        fprintf(stderr, "použití: %s [-t <ms>] <host> <port>\n", argv[0]);
         return 2;
     }
 
@@ -600,7 +611,7 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     struct client c;
-    if (client_connect(&c, argv[1], (uint16_t)port) != 0)
+    if (client_connect(&c, argv[a], (uint16_t)port, (int)timeout) != 0)
         return 1;
 
     int code = repl(&c);

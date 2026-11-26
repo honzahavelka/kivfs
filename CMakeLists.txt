@@ -27,6 +27,7 @@ add_library(common_lib
     common/proto/hello.c       common/proto/hello.h
     common/proto/diag.c        common/proto/diag.h
     common/proto/fsproto.c     common/proto/fsproto.h
+    common/proto/syncproto.c   common/proto/syncproto.h
     common/net/socket.c        common/net/socket.h
     common/net/channel.c       common/net/channel.h
     common/util/queue.c        common/util/queue.h
@@ -58,7 +59,7 @@ target_link_libraries(kivfs-client PRIVATE common_lib)
 # Testy (spuštění: ctest v build adresáři)
 # ---------------------------------------------------------------------
 enable_testing()
-foreach(t protocol channel queue hello fsproto)
+foreach(t protocol channel queue hello fsproto syncproto)
     add_executable(test_${t} tests/unit/test_${t}.c)
     target_link_libraries(test_${t} PRIVATE common_lib)
     add_test(NAME ${t} COMMAND test_${t})
@@ -69,6 +70,12 @@ add_executable(test_db_mock tests/unit/test_db_mock.c server/db/backend_mock.c)
 target_include_directories(test_db_mock PRIVATE server)
 target_link_libraries(test_db_mock PRIVATE common_lib)
 add_test(NAME db_mock COMMAND test_db_mock)
+
+# pruh Syncu (hodiny + seřazená fronta) – čistá datová struktura, přenositelné
+add_executable(test_lane tests/unit/test_lane.c server/sync/lane.c)
+target_include_directories(test_lane PRIVATE server)
+target_link_libraries(test_lane PRIVATE common_lib)
+add_test(NAME lane COMMAND test_lane)
 
 # kontrola práv VFS – čisté funkce, také přenositelné
 add_executable(test_vfs_perm tests/unit/test_vfs_perm.c server/vfs/perm.c)
@@ -97,6 +104,10 @@ if(TARGET server_core)
     endforeach()
     target_sources(kivfs-vfs PRIVATE server/vfs/perm.c         server/vfs/perm.h)
     target_sources(kivfs-db  PRIVATE server/db/backend_mock.c  server/db/backend.h)
+    target_sources(kivfs-sync PRIVATE
+        server/sync/sync.h    server/sync/lane.c    server/sync/lane.h
+        server/sync/origin.c  server/sync/peer.c    server/sync/outbox.c
+        server/sync/resolve.c server/sync/apply.c)
 
     add_executable(kivfs-check tools/check.c)
     target_link_libraries(kivfs-check PRIVATE server_core)
@@ -107,13 +118,22 @@ if(TARGET server_core)
                      ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/conf/local)
     set_tests_properties(cluster_local PROPERTIES
         TIMEOUT 120
-        RUN_SERIAL TRUE)   # pevné porty 310xx–330xx
+        RUN_SERIAL TRUE)   # pevné porty 310xx–312xx
 
     # Scénář: operace FS přes klienta na jednom uzlu, výpadek a obnova DB
     add_test(NAME fs_local
              COMMAND ${CMAKE_SOURCE_DIR}/tests/scenarios/fs-local.sh
-                     ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/conf/local/node1.ini)
+                     ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/conf/single/node1.ini)
     set_tests_properties(fs_local PROPERTIES
         TIMEOUT 120
         RUN_SERIAL TRUE)
+
+    # Scénář: kolo hlasování Syncu na 3 uzlech – souběh, výpadek, obnova,
+    # zamrzlý uzel (op_timeout_ms zkrácen na 2 s v kopii konfigurace)
+    add_test(NAME sync_local
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/scenarios/sync-local.sh
+                     ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/conf/local)
+    set_tests_properties(sync_local PROPERTIES
+        TIMEOUT 150
+        RUN_SERIAL TRUE)   # pevné porty 310xx–312xx
 endif()

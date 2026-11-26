@@ -14,7 +14,7 @@
  *
  * Životní cyklus – odeslání požadavku:
  *     struct kivfs_packet req;
- *     kivfs_pkt_init(&req, KIVFS_REQ_..., lamport_ts);   // nic nealokuje
+ *     kivfs_pkt_init(&req, KIVFS_REQ_..., ts);           // nic nealokuje
  *     kivfs_pkt_add_string(&req, "/kivfs");              // alokuje dle potřeby
  *     kivfs_pkt_add_u64(&req, offset);
  *     ... odeslat ...

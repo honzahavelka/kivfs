@@ -208,12 +208,13 @@ static int cluster_key(const char *key, const char *value, int line, void *ud)
     struct ctx *x = ud;
     struct kivfs_modconf *mc = x->mc;
 
-    if (strcmp(key, "local") == 0)
+    if (strcmp(key, "local") == 0 || strcmp(key, "op_timeout_ms") == 0)
         return 0;                               /* řeší se po načtení uzlů */
 
     uint32_t id = node_id_of(key);
     if (id == 0)
-        return fail(x, line, "[cluster]: neznámý klíč '%s' (povolené: local, node1, node2, ...)", key);
+        return fail(x, line, "[cluster]: neznámý klíč '%s' (povolené: local, op_timeout_ms, "
+                    "node1, node2, ...)", key);
     if (mc->node_count >= KIVFS_MAX_NODES)
         return fail(x, line, "[cluster]: víc než %d uzlů", KIVFS_MAX_NODES);
 
@@ -346,6 +347,17 @@ int kivfs_modconf_from(const struct kivfs_config *c, enum kivfs_module self,
         return fail(&x, kivfs_config_line(c, "cluster", "local"),
                     "[cluster] local: '%s' není žádný z uzlů nodeN v [cluster]", local);
     out->local_node = lid;
+
+    /* 5) [cluster] op_timeout_ms – časový rámec jedné operace (7.4.3) */
+    out->op_timeout_ms = KIVFS_OP_TIMEOUT_DEFAULT_MS;
+    const char *ot = kivfs_config_get(c, "cluster", "op_timeout_ms");
+    if (ot != NULL) {
+        if (parse_uint(ot, KIVFS_OP_TIMEOUT_MIN_MS, KIVFS_OP_TIMEOUT_MAX_MS, &v) != 0)
+            return fail(&x, kivfs_config_line(c, "cluster", "op_timeout_ms"),
+                        "[cluster] op_timeout_ms: '%s' není číslo %d..%d", ot,
+                        KIVFS_OP_TIMEOUT_MIN_MS, KIVFS_OP_TIMEOUT_MAX_MS);
+        out->op_timeout_ms = (int)v;
+    }
     return KIVFS_OK;
 }
 
