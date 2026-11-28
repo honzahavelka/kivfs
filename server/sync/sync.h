@@ -95,16 +95,16 @@
  *   Zahodit smí jen když odpověděli VŠICHNI – jinak by se repliky rozešly.
  *
  * ------------------------------------------------------------------
- * KONFIGURACE (doplnit do modconf)
+ * KONFIGURACE
  *   [cluster] op_timeout_ms = 30000   časový rámec jedné operace (7.4.3:
  *             Timeout, výchozí 30 s); v [cluster], protože ho potřebuje
  *             i Auth (čeká na Sync) – [cluster] čtou všechny moduly
  *   [sync]    order_cli = yes|no      kolo Tcli pro klientské operace
- *   Odvozené timeouty (všechny < op_timeout, ať odpověď stihne zpět):
- *     round_timeout = op_timeout / 4   jedno kolo PROPOSE
- *     vfs_timeout   = op_timeout / 2   Sync -> VFS
- *     Auth -> Sync  = op_timeout
- *     klient        = op_timeout + rezerva (parametr klienta)
+ *   Odvozené timeouty: kivfs_modconf_timeouts (modconf.h) – celý řetěz
+ *   Auth > Sync > VFS > DB > kolo na jednom místě. Sync používá:
+ *     round_timeout = 2/16 O   kolo PROPOSE, outbox, QUERY, CLOCK
+ *     vfs_timeout   = 8/16 O   Sync -> VFS
+ *     apply_timeout = 1/16 O   DB_APPLY, DB_LOG_HEAD (vypršení = zopakovat)
  */
 
 #include <stdint.h>

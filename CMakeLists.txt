@@ -32,6 +32,7 @@ add_library(common_lib
     common/net/channel.c       common/net/channel.h
     common/util/queue.c        common/util/queue.h
     common/util/config.c       common/util/config.h
+    common/util/sha256.c       common/util/sha256.h
 )
 target_include_directories(common_lib PUBLIC common)
 target_link_libraries(common_lib PUBLIC Threads::Threads)
@@ -59,7 +60,7 @@ target_link_libraries(kivfs-client PRIVATE common_lib)
 # Testy (spuštění: ctest v build adresáři)
 # ---------------------------------------------------------------------
 enable_testing()
-foreach(t protocol channel queue hello fsproto syncproto)
+foreach(t protocol channel queue hello fsproto syncproto sha256)
     add_executable(test_${t} tests/unit/test_${t}.c)
     target_link_libraries(test_${t} PRIVATE common_lib)
     add_test(NAME ${t} COMMAND test_${t})
@@ -70,6 +71,13 @@ add_executable(test_db_mock tests/unit/test_db_mock.c server/db/backend_mock.c)
 target_include_directories(test_db_mock PRIVATE server)
 target_link_libraries(test_db_mock PRIVATE common_lib)
 add_test(NAME db_mock COMMAND test_db_mock)
+
+# úložiště bloků FS (adresář + mock) – jen POSIX, běží i na macOS
+add_executable(test_store tests/unit/test_store.c
+               server/fs/store_dir.c server/fs/store_mock.c)
+target_include_directories(test_store PRIVATE server)
+target_link_libraries(test_store PRIVATE common_lib)
+add_test(NAME store COMMAND test_store)
 
 # pruh Syncu (hodiny + seřazená fronta) – čistá datová struktura, přenositelné
 add_executable(test_lane tests/unit/test_lane.c server/sync/lane.c)
@@ -134,6 +142,15 @@ if(TARGET server_core)
              COMMAND ${CMAKE_SOURCE_DIR}/tests/scenarios/sync-local.sh
                      ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/conf/local)
     set_tests_properties(sync_local PROPERTIES
+        TIMEOUT 150
+        RUN_SERIAL TRUE)   # pevné porty 310xx–312xx
+
+    # Scénář: replikace metadat (pruh DB) na 3 uzlech – shoda stromu, souběh
+    # stejných jmen, zamrzlá / restartovaná DB, restart Syncu s ověřením
+    add_test(NAME repl_local
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/scenarios/repl-local.sh
+                     ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/conf/local)
+    set_tests_properties(repl_local PROPERTIES
         TIMEOUT 150
         RUN_SERIAL TRUE)   # pevné porty 310xx–312xx
 endif()

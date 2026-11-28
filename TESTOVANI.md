@@ -59,7 +59,7 @@ projektu – nepoužívat, má v cache jinou konfiguraci.)
 ctest --test-dir build --output-on-failure
 ```
 
-Co se spustí (celkem 16 testů, ~15 s; na konci `100% tests passed`):
+Co se spustí (celkem 17 testů, ~1 min; na konci `100% tests passed`):
 
 | Test | Co ověřuje | Doba |
 |---|---|---|
@@ -67,14 +67,15 @@ Co se spustí (celkem 16 testů, ~15 s; na konci `100% tests passed`):
 | `hello` | HELLO a bloky STATUS (bez sítě) | okamžitě |
 | `fsproto` | attr/entry/ctx na drátě, pravidla cesty | okamžitě |
 | `syncproto` | zprávy Syncu na drátě (sync_hdr, dbop, arch_hdr…), přenos DB operace | okamžitě |
-| `lane` | pruh Syncu: Lamportovy hodiny, seřazená fronta, stabilita + simulace hlasování 3 uzlů (300 náhodných běhů) | < 1 s |
-| `db_mock` | strom metadat v paměti (EXISTS, NOT_EMPTY, řazení, 2000 položek) | okamžitě |
+| `lane` | pruh Syncu: Lamportovy hodiny, seřazená fronta, stabilita, hold (čekání na potvrzení COMMIT) + simulace hlasování 3 uzlů s potvrzováním (300 náhodných běhů) | < 1 s |
+| `db_mock` | strom metadat + archiv (MESSAGE_LOGS) v paměti: apply s explicitním id/časem, pořadí indexů, archiv i u EXISTS, log_read, determinismus 2 replik | okamžitě |
 | `vfs_perm` | kontrola práv rwx | okamžitě |
-| `config` | INI parser, validace, všechny šablony v `conf/`, `op_timeout_ms` | okamžitě |
+| `config` | INI parser, validace, všechny šablony v `conf/`, `op_timeout_ms` a řetěz odvozených timeoutů | okamžitě |
 | `reactor`, `reactor_out`, `events` | epoll reactor, odchozí spojení, timeouty, fronta událostí | ~1 s každý |
 | `cluster_local` | **scénář**: 3 uzly × 5 modulů na jednom stroji se propojí; výpadek a obnova Syncu | ~2 s |
 | `fs_local` | **scénář**: mkdir/ls/stat/rmdir přes klienta (cluster s 1 uzlem, `conf/single`), chyby, výpadek a obnova DB | ~1 s |
-| `sync_local` | **scénář**: kolo hlasování na 3 uzlech – souběh 3 klientů, výpadek / obnova / zamrznutí (SIGSTOP) Syncu | ~6 s |
+| `sync_local` | **scénář**: kolo hlasování na 3 uzlech – souběh 3 klientů, výpadek / obnova / zamrznutí (SIGSTOP) Syncu | ~10 s |
+| `repl_local` | **scénář**: replikace metadat na 3 uzlech – stejný strom (id, časy), souběžný mkdir stejného jména (přesně jeden EXISTS), zamrzlá a restartovaná DB, restart Syncu s ověřením | ~30 s |
 
 Užitečné varianty:
 
@@ -90,11 +91,13 @@ Scénáře lze pustit i přímo (hezčí výstup, vypíší adresář s logy pro
 tests/scenarios/fs-local.sh build
 tests/scenarios/cluster-local.sh build
 tests/scenarios/sync-local.sh build
+tests/scenarios/repl-local.sh build
 ```
 
 Výsledek je na posledním řádku: `SCÉNÁŘ OK`, nebo `SCÉNÁŘ SELHAL` + řádky
-`!! ...` s důvodem. Logy jednotlivých modulů jsou v `/tmp/kivfs-fs.XXXX/`
-nebo `/tmp/kivfs-cluster.XXXX/` (název se vypíše) – po `exit` z kontejneru
+`!! ...` s důvodem. Logy jednotlivých modulů jsou v `/tmp/kivfs-fs.XXXX/`,
+`/tmp/kivfs-cluster.XXXX/`, `/tmp/kivfs-sync.XXXX/` nebo `/tmp/kivfs-repl.XXXX/`
+(název se vypíše) – po `exit` z kontejneru
 zmizí, takže je prohlédni předtím.
 
 ### A5. Sanitizery (hledání chyb paměti a souběhu)
@@ -194,8 +197,18 @@ Porty v `conf/local`: node1 = 310xx, node2 = 311xx, node3 = 312xx
 (Auth = …01, Sync …02, VFS …03, DB …04, FS …05). Klient na node2:
 `build/kivfs-client 127.0.0.1 31101`.
 
-Pozor: **uzly zatím nesdílejí metadata** – `mkdir` na node1 na node2 neuvidíš.
-To přijde se Syncem.
+Metadata se replikují (pruh DB): `mkdir` na node1 je hned vidět i na node2
+a node3 – se stejným id i časy:
+
+```sh
+printf 'mkdir /a\nquit\n' | build/kivfs-client 127.0.0.1 31001
+printf 'stat /a\nquit\n'  | build/kivfs-client 127.0.0.1 31101
+```
+
+Známé omezení: **restart DB uzlu** (mock = prázdná metadata) uzel zastaví
+(log Syncu „pruh DB ZASTAVEN – uzel potřebuje obnovu“; zápisy na něm
+UNAVAILABLE, ostatní uzly jedou dál). Obnova z ostatních uzlů zatím není –
+pomůže jen restart celého clusteru.
 
 ---
 

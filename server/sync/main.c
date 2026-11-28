@@ -117,10 +117,12 @@ static int sync_init(struct kivfs_mod *m, const struct kivfs_config *cfg)
         fprintf(stderr, "kivfs-sync: [sync] order_cli: '%s' (povoleno yes/no)\n", oc);
         goto fail;
     }
-    st->op_timeout_ms    = mc->op_timeout_ms;
-    st->round_timeout_ms = mc->op_timeout_ms / 4;
-    st->vfs_timeout_ms   = mc->op_timeout_ms / 2;
-    st->apply_timeout_ms = mc->op_timeout_ms / 4;   /* prozatím – řetěz v úkolu 4 */
+    struct kivfs_timeouts to;
+    kivfs_modconf_timeouts(mc, &to);           /* celý řetěz: modconf.h */
+    st->op_timeout_ms    = to.op;
+    st->round_timeout_ms = to.round;
+    st->vfs_timeout_ms   = to.sync_vfs;
+    st->apply_timeout_ms = to.sync_apply;
     st->self_node        = mc->local_node;
 
     for (size_t i = 0; i < mc->node_count; i++) {

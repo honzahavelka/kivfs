@@ -374,6 +374,18 @@ void kivfs_modconf_reactor_cfg(const struct kivfs_modconf *mc, struct kivfs_reac
     out->connect_timeout_ms = mc->connect_timeout_ms;
 }
 
+void kivfs_modconf_timeouts(const struct kivfs_modconf *mc, struct kivfs_timeouts *out)
+{
+    int o = mc->op_timeout_ms;
+    out->op           = o;
+    out->round        = o * 2 / 16;
+    out->sync_vfs     = o * 8 / 16;
+    out->vfs_db_read  = o * 2 / 16;
+    out->vfs_db_write = o * 5 / 16;
+    out->db_submit    = o * 4 / 16;
+    out->sync_apply   = o / 16;
+}
+
 const struct kivfs_node_addr *kivfs_modconf_node(const struct kivfs_modconf *mc, uint32_t id)
 {
     for (size_t i = 0; i < mc->node_count; i++)

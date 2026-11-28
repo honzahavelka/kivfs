@@ -302,6 +302,31 @@ static void test_modconf_errors(void)
     CHECK(modconf_text(CLUSTER MODULES, KIVFS_MOD_CLIENT, NULL, &mc) == KIVFS_EINVAL);
 }
 
+/* Řetěz timeoutů (modconf.h): vnitřní < vnější, ať vnější dostane
+ * skutečnou odpověď; vše >= 25 ms i pro nejmenší povolené O. */
+static void test_timeouts(void)
+{
+    const int ops[] = { KIVFS_OP_TIMEOUT_MIN_MS, 401, 2000, 30000, 30007, KIVFS_OP_TIMEOUT_MAX_MS };
+    for (size_t i = 0; i < sizeof ops / sizeof ops[0]; i++) {
+        struct kivfs_modconf mc;
+        struct kivfs_timeouts t;
+        memset(&mc, 0, sizeof mc);
+        mc.op_timeout_ms = ops[i];
+        kivfs_modconf_timeouts(&mc, &t);
+        CHECK(t.op == ops[i]);
+        /* Auth -> Sync: kolo + Sync -> VFS se vejde i s čekáním ve frontě */
+        CHECK(t.round + t.sync_vfs < t.op);
+        /* VFS: 2 čtení, nebo čtení + zápis, < Sync -> VFS */
+        CHECK(2 * t.vfs_db_read < t.sync_vfs);
+        CHECK(t.vfs_db_read + t.vfs_db_write < t.sync_vfs);
+        /* DB: SUBMIT < VFS -> DB zápis */
+        CHECK(t.db_submit < t.vfs_db_write);
+        /* uvnitř SUBMIT: kolo (selhání -> UNAVAILABLE dřív než TIMEOUT) + APPLY */
+        CHECK(t.round + t.sync_apply < t.db_submit);
+        CHECK(t.sync_apply >= 25 && t.round >= 25 && t.vfs_db_read >= 25);
+    }
+}
+
 /* Všechny šablony z conf/ musí projít pro všech 5 modulů. */
 static void test_templates(void)
 {
@@ -373,6 +398,7 @@ int main(void)
     test_parser_errors();
     test_modconf_ok();
     test_modconf_errors();
+    test_timeouts();
     test_templates();
     test_op_timeout();
     printf("config: %d checks, %d failed\n", g_checks, g_failed);

@@ -59,11 +59,13 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
-/* Timeout čekání na SUBMIT. Prozatímní – celý řetěz timeoutů
- * (Auth > Sync > VFS > DB > kolo) se navrhne v úkolu 4. */
+/* Timeout čekání na SUBMIT (kivfs_modconf_timeouts: db_submit < VFS->DB
+ * zápis; uvnitř kolo + potvrzení COMMIT + fronta pruhu DB + APPLY). */
 static int submit_timeout_ms(const struct kivfs_mod *m)
 {
-    return kivfs_mod_conf(m)->op_timeout_ms / 4;
+    struct kivfs_timeouts t;
+    kivfs_modconf_timeouts(kivfs_mod_conf(m), &t);
+    return t.db_submit;
 }
 
 static int db_init(struct kivfs_mod *m, const struct kivfs_config *cfg)

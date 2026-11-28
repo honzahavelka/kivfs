@@ -6,7 +6,7 @@
 # Použití:  tests/scenarios/sync-local.sh <adresář s binárkami> [adresář conf/local]
 #
 # Konfigurace se zkopíruje s [cluster] op_timeout_ms = 2000 (kolo PROPOSE
-# pak vyprší za 500 ms). Ověří:
+# pak vyprší za 2/16 = 250 ms, viz kivfs_modconf_timeouts). Ověří:
 #   1. každá klientská operace projde kolem Tcli přes všechny 3 uzly
 #   2. SOUBĚH: 3 klienti (na každém uzlu jeden) najednou po 40 mkdir –
 #      vše projde, bez BUSY/UNAVAILABLE
@@ -140,7 +140,7 @@ done
 step "5. zamrzlý sync@node3 (SIGSTOP)"
 kill -STOP "${PID[3-sync]}"
 t0=$(ms); expect 1 "mkdir /zamrzly" "UNAVAILABLE"; dt=$(( $(ms) - t0 ))
-[ $dt -ge 400 ] || fail "UNAVAILABLE za $dt ms – kolo mělo čekat na timeout (500 ms)"
+[ $dt -ge 200 ] || fail "UNAVAILABLE za $dt ms – kolo mělo čekat na timeout (250 ms)"
 kill -CONT "${PID[3-sync]}"
 ok=0
 for _ in $(seq 1 20); do

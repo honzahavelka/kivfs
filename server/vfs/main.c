@@ -12,11 +12,15 @@
  *
  * Mezi kontrolou práv a zápisem může strom změnit jiná operace – DB
  * proto konzistenci kontroluje znovu (EXISTS, NOT_FOUND, NOT_EMPTY).
+ * Zápisy (DB_MKNODE, DB_RMNODE) jdou v DB přes Sync (kolo Tdb, replikace
+ * na všechny uzly); když na ně nepřijde odpověď, je výsledek neznámý ->
+ * TIMEOUT (ne UNAVAILABLE).
  * Operace přes dvě volání DB = dvě půlky spojené pokračováním
  * (kivfs_mod_call), stav operace je v struct vop.
  * Použití: kivfs-vfs -c <soubor.ini>
  */
 #include "core/module.h"
+#include "core/modconf.h"
 #include "proto/errors.h"
 #include "proto/fsproto.h"
 #include "proto/protocol.h"
@@ -25,7 +29,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DB_TIMEOUT_MS 1000      /* 2 volání DB (2 s) < Sync->VFS 3 s */
+/* Timeouty volání DB (kivfs_modconf_timeouts): čtení vfs_db_read, zápis
+ * vfs_db_write. Zápis bez odpovědi = výsledek NEZNÁMÝ (kolo Tdb mohlo
+ * proběhnout) -> TIMEOUT; čtení nic nemění -> UNAVAILABLE. */
+static int db_read_ms(const struct kivfs_mod *m)
+{
+    struct kivfs_timeouts t;
+    kivfs_modconf_timeouts(kivfs_mod_conf(m), &t);
+    return t.vfs_db_read;
+}
+
+static int db_write_ms(const struct kivfs_mod *m)
+{
+    struct kivfs_timeouts t;
+    kivfs_modconf_timeouts(kivfs_mod_conf(m), &t);
+    return t.vfs_db_write;
+}
 
 /* Rozpracovaná operace (mezi 1. a 2. voláním DB). */
 struct vop {
@@ -63,24 +82,29 @@ static int db_packet(struct kivfs_packet *q, uint16_t code, const char *path,
     return rc;
 }
 
-/* Poslední krok: přeposlat do DB a odpověď DB vrátit Syncu (LIST, RMDIR). */
+/* Poslední krok: přeposlat do DB a odpověď DB vrátit Syncu (STAT, LIST,
+ * RMDIR). RMDIR je zápis -> jiný timeout a bez odpovědi TIMEOUT. */
 static void finish_forward(struct kivfs_mod *m, struct vop *op, uint16_t db_code)
 {
     struct kivfs_packet q;
     struct kivfs_packet orig = { .header = op->orig };
     struct kivfs_mod_peer to = { .conn = op->to };
+    int write = db_code == KIVFS_REQ_DB_RMNODE;
     if (db_packet(&q, db_code, op->path, op, 0) != KIVFS_OK)
         vop_reply(m, op, KIVFS_STATUS_INTERNAL);
     else
-        kivfs_mod_forward(m, &to, &orig, &q, KIVFS_MOD_DB, DB_TIMEOUT_MS);
+        kivfs_mod_forward(m, &to, &orig, &q, KIVFS_MOD_DB,
+                          write ? db_write_ms(m) : db_read_ms(m),
+                          write ? KIVFS_STATUS_TIMEOUT : KIVFS_STATUS_UNAVAILABLE);
     free(op);
 }
 
-/* MKDIR, 2. půlka: DB vrací [attr], klient chce jen stav. */
+/* MKDIR, 2. půlka: DB vrací [attr], klient chce jen stav. Bez odpovědi
+ * = výsledek neznámý (zápis mohl proběhnout) -> TIMEOUT. */
 static void after_mknode(struct kivfs_mod *m, void *state, int err, struct kivfs_packet *resp)
 {
     struct vop *op = state;
-    vop_reply(m, op, err == KIVFS_OK ? resp->header.return_value : KIVFS_STATUS_UNAVAILABLE);
+    vop_reply(m, op, err == KIVFS_OK ? resp->header.return_value : KIVFS_STATUS_TIMEOUT);
     free(op);
 }
 
@@ -127,7 +151,7 @@ static void after_get(struct kivfs_mod *m, void *state, int err, struct kivfs_pa
         struct kivfs_packet q;
         int rc = db_packet(&q, KIVFS_REQ_DB_MKNODE, op->path, op, 1);
         if (rc == KIVFS_OK)
-            rc = kivfs_mod_call(m, KIVFS_MOD_DB, &q, DB_TIMEOUT_MS, after_mknode, op);
+            rc = kivfs_mod_call(m, KIVFS_MOD_DB, &q, db_write_ms(m), after_mknode, op);
         if (rc != KIVFS_OK) {
             vop_reply(m, op, call_error_status(rc));
             free(op);
@@ -190,7 +214,7 @@ static int on_request(struct kivfs_mod *m, const struct kivfs_mod_peer *from,
     struct kivfs_packet q;
     int rc = db_packet(&q, KIVFS_REQ_DB_GET, target, op, 0);
     if (rc == KIVFS_OK)
-        rc = kivfs_mod_call(m, KIVFS_MOD_DB, &q, DB_TIMEOUT_MS, after_get, op);
+        rc = kivfs_mod_call(m, KIVFS_MOD_DB, &q, db_read_ms(m), after_get, op);
     if (rc != KIVFS_OK) {
         vop_reply(m, op, call_error_status(rc));
         free(op);

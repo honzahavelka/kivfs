@@ -92,6 +92,7 @@ struct mtimer {
 struct fwd {
     kivfs_conn_id       to;
     struct kivfs_header orig;          /* hlavička původního požadavku (kód + ref) */
+    int16_t             lost_status;   /* odesláno, ale bez odpovědi */
 };
 
 struct kivfs_mod {
@@ -560,7 +561,7 @@ static void fwd_cont(struct kivfs_mod *m, void *state, int err, struct kivfs_pac
     struct fwd *f = state;
     struct kivfs_packet orig = { .header = f->orig };   /* init_response čte jen hlavičku */
     struct kivfs_packet out;
-    int16_t status = err == KIVFS_OK ? resp->header.return_value : KIVFS_STATUS_UNAVAILABLE;
+    int16_t status = err == KIVFS_OK ? resp->header.return_value : f->lost_status;
 
     if (kivfs_pkt_init_response(&out, &orig, ++m->clock, status) == KIVFS_OK) {
         if (err == KIVFS_OK) {
@@ -587,7 +588,7 @@ static void fwd_cont(struct kivfs_mod *m, void *state, int err, struct kivfs_pac
 
 void kivfs_mod_forward(struct kivfs_mod *m, const struct kivfs_mod_peer *from,
                        const struct kivfs_packet *orig, struct kivfs_packet *fwd,
-                       enum kivfs_module to, int timeout_ms)
+                       enum kivfs_module to, int timeout_ms, int16_t lost_status)
 {
     struct fwd *f = malloc(sizeof *f);
     if (f == NULL) {
@@ -597,6 +598,7 @@ void kivfs_mod_forward(struct kivfs_mod *m, const struct kivfs_mod_peer *from,
     }
     f->to   = from->conn;
     f->orig = orig->header;
+    f->lost_status = lost_status;
     int rc = kivfs_mod_call(m, to, fwd, timeout_ms, fwd_cont, f);
     if (rc != KIVFS_OK) {
         kivfs_mod_reply_status(m, from->conn, orig,

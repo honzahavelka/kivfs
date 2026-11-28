@@ -131,6 +131,30 @@ int  kivfs_modconf_from(const struct kivfs_config *c, enum kivfs_module self,
 void kivfs_modconf_reactor_cfg(const struct kivfs_modconf *mc,
                                struct kivfs_reactor_config *out);
 
+/* Odvozené timeouty jedné operace z [cluster] op_timeout_ms (O). Každý
+ * vnitřní vyprší dřív než vnější, aby vnější dostal skutečnou odpověď
+ * (UNAVAILABLE = jistě neproběhlo, TIMEOUT = neznámé), ne jen vlastní
+ * vypršení. Řetěz zápisu (MKDIR), v šestnáctinách O:
+ *   Auth -> Sync            16   celý rámec; klient (-t) musí mít víc
+ *     kolo PROPOSE           2   CLI i DB; i outbox, QUERY, CLOCK
+ *     Sync -> VFS            8   kolo + VFS + čekání ve frontě CLI < 16
+ *       VFS -> DB čtení      2   GET, LIST (nejvýš 2 za sebou)
+ *       VFS -> DB zápis      5   MKNODE, RMNODE (po GET: 2 + 5 < 8)
+ *         DB -> SUBMIT       4   < 5: kolo 2 + potvrzení COMMIT + fronta + APPLY
+ *           Sync -> APPLY    1   i DB_LOG_HEAD; vypršení = zopakovat
+ * Hodnoty v ms, op_timeout_ms 400..600000 (modconf) -> vše >= 25 ms. */
+struct kivfs_timeouts {
+    int op;            /* Auth -> Sync */
+    int round;         /* kolo PROPOSE, outbox, QUERY, CLOCK */
+    int sync_vfs;
+    int vfs_db_read;
+    int vfs_db_write;
+    int db_submit;
+    int sync_apply;    /* DB_APPLY, DB_LOG_HEAD */
+};
+
+void kivfs_modconf_timeouts(const struct kivfs_modconf *mc, struct kivfs_timeouts *out);
+
 /* Adresa Sync uzlu id, nebo NULL. */
 const struct kivfs_node_addr *kivfs_modconf_node(const struct kivfs_modconf *mc, uint32_t id);
 

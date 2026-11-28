@@ -153,10 +153,13 @@ int      kivfs_mod_call_node(struct kivfs_mod *m, uint32_t node, struct kivfs_pa
  *   fwd         = paket, který se pošle dál (převezme se vždy); kód
  *                 požadavku se zachová
  * Chyby se odesílateli odpoví samy: linka dole -> UNAVAILABLE, plno ->
- * BUSY, timeout/pád spojení -> UNAVAILABLE. Vrací vždy "převzato". */
+ * BUSY (neodesláno = jistě neproběhlo); po odeslání timeout / pád spojení
+ * / ukončování -> lost_status: KIVFS_STATUS_UNAVAILABLE pro čtení (nic
+ * nemění), KIVFS_STATUS_TIMEOUT pro zápisy (výsledek neznámý).
+ * Vrací vždy "převzato". */
 void     kivfs_mod_forward(struct kivfs_mod *m, const struct kivfs_mod_peer *from,
                            const struct kivfs_packet *orig, struct kivfs_packet *fwd,
-                           enum kivfs_module to, int timeout_ms);
+                           enum kivfs_module to, int timeout_ms, int16_t lost_status);
 
 /* Celý život modulu; vrací exit kód procesu (0 = řádně ukončen signálem,
  * 1 = chyba konfigurace nebo startu). */

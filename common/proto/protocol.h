@@ -91,7 +91,7 @@
 
 /* Verze protokolu posílaná v HELLO; strany s různou verzí se odmítnou.
  * Zvýšit při každé nekompatibilní změně formátu. */
-#define KIVFS_PROTO_VERSION     1u
+#define KIVFS_PROTO_VERSION     2u
 
 /* Druh protistrany – serverové moduly (kap. 7.1) a CLI klient.
  * Bude se posílat v HELLO, proto patří k protokolu; hodnoty se nesmí měnit.
@@ -256,9 +256,10 @@ enum kivfs_status {
     KIVFS_STATUS_TIMEOUT       = -12,  /* výsledek NEZNÁMÝ – operace mohla
                                         * proběhnout (na rozdíl od UNAVAILABLE,
                                         * které znamená „jistě neprovedeno“) */
-    KIVFS_STATUS_VIEW_MISMATCH = -13   /* Sync: nesedí epocha pohledu, nebo
+    KIVFS_STATUS_VIEW_MISMATCH = -13,  /* Sync: nesedí epocha pohledu, nebo
                                         * odesílatel není členem pohledu
                                         * (i stará incarnation) */
+    KIVFS_STATUS_NO_SPACE      = -14   /* FS: došlo místo na úložišti bloků */
 };
 
 /* Vrátí statický název stavu pro výpisy a logy ("OK", "BUSY", ...).

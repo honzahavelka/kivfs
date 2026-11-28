@@ -99,7 +99,7 @@
  * Hrany DB -> SYNC (SUBMIT) a SYNC -> DB (APPLY, LOG_*) jsou
  * v kivfs_module_may_call; kaskáda STATUS jde zvlášť po stromu
  * kivfs_module_status_child (hello.h), takže se nezacyklí.
- * Až se zprávy začnou používat, zvýšit KIVFS_PROTO_VERSION na 2.
+ * Používají se od KIVFS_PROTO_VERSION 2 (26. 11.).
  * ------------------------------------------------------------------
  */
 

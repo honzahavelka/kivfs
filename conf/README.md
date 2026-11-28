@@ -46,7 +46,23 @@ Pravidla, která se snadno přehlédnou:
 
 | Sekce | Klíč | Význam |
 |---|---|---|
-| `[cluster]` | `op_timeout_ms` | časový rámec jedné operace klienta, 400–600000 (výchozí 30000 jako `Timeout` v původní práci, kap. 7.4.3). Auth čeká na Sync celý rámec, Sync na kolo hlasování 1/4 a na VFS 1/2. Klient musí mít timeout větší (`kivfs-client -t <ms>`, výchozí 35000). |
+| `[cluster]` | `op_timeout_ms` | časový rámec jedné operace klienta, 400–600000 (výchozí 30000 jako `Timeout` v původní práci, kap. 7.4.3). Ostatní timeouty se z něj odvozují (`kivfs_modconf_timeouts`, `server/core/modconf.h`) – viz tabulka níže. Klient musí mít timeout větší (`kivfs-client -t <ms>`, výchozí 35000). |
 | `[sync]` | `order_cli` | `yes` (výchozí) = každá klientská operace nejdřív dostane časovou značku Tcli hlasováním všech uzlů (kap. 7.4.1) a provádí se sériově v jejím pořadí; `no` = rovnou do VFS (pro měření rozdílu). |
 | `[sync]` | `max_pending` | (obecný klíč) u Syncu zvýšit, šablony mají 256 – na jednom spojení k jinému Syncu čekají souběžná kola i COMMIT/ABORT. |
 | `[db]` | `backend` | úložiště metadat: `mock` (výchozí, strom v paměti – po restartu prázdný) |
+
+### Odvozené timeouty (O = `op_timeout_ms`)
+
+Každý vnitřní timeout vyprší dřív než vnější, aby vnější krok dostal skutečnou
+odpověď: UNAVAILABLE = operace jistě neproběhla, TIMEOUT = výsledek neznámý
+(zápis mohl proběhnout – kolo Tdb je dohodnuté a dokončí se).
+
+| Krok | Timeout | O = 30 s | Poznámka |
+|---|---|---|---|
+| Auth → Sync | O | 30 s | bez odpovědi → TIMEOUT |
+| kolo PROPOSE (CLI i DB), outbox, QUERY, CLOCK | 2/16 O | 3,75 s | selhání kola → UNAVAILABLE |
+| Sync → VFS | 8/16 O | 15 s | zbytek O = čekání ve frontě CLI (sériové provádění) |
+| VFS → DB čtení (GET, LIST) | 2/16 O | 3,75 s | bez odpovědi → UNAVAILABLE |
+| VFS → DB zápis (MKNODE, RMNODE) | 5/16 O | 9,4 s | bez odpovědi → TIMEOUT |
+| DB → Sync SUBMIT | 4/16 O | 7,5 s | kolo + potvrzení COMMIT + fronta pruhu DB + APPLY; bez odpovědi → TIMEOUT |
+| Sync → DB APPLY, LOG_HEAD | 1/16 O | 1,9 s | vypršení = APPLY se zopakuje (DB pozná opakování) |

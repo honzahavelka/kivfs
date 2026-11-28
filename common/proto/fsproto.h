@@ -41,6 +41,14 @@
 #define KIVFS_MODE_FILE        0100000u
 #define KIVFS_MODE_PERM_MASK   0007777u
 
+/* Velikost bloku (fragmentu) souboru, kap. 7.7.2: [fs] fragment.
+ * Horní mez: blok + hlavička + lístek + otisk se musí vejít do paketu
+ * (KIVFS_MAX_PAYLOAD 16 MiB). Velikost se ukládá u každého souboru,
+ * proto úložiště přijme cokoli do MAX bez ohledu na konfiguraci. */
+#define KIVFS_FS_BLOCK_MIN     (64u * 1024u)
+#define KIVFS_FS_BLOCK_MAX     (15u * 1024u * 1024u)
+#define KIVFS_FS_BLOCK_DEFAULT (4u * 1024u * 1024u)
+
 struct kivfs_attr {
     uint64_t id;
     uint32_t mode, uid, gid;

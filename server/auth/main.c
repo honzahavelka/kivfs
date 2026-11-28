@@ -47,8 +47,12 @@ static int on_request(struct kivfs_mod *m, const struct kivfs_mod_peer *from,
         return 1;
     }
     /* Auth -> Sync = celý časový rámec operace ([cluster] op_timeout_ms);
-     * Sync si své kroky odvodí kratší, ať odpověď stihne zpět */
-    kivfs_mod_forward(m, from, req, &fwd, KIVFS_MOD_SYNC, kivfs_mod_conf(m)->op_timeout_ms);
+     * Sync si své kroky odvodí kratší (kivfs_modconf_timeouts), ať odpověď
+     * stihne zpět. Bez odpovědi = výsledek neznámý (zápis mohl proběhnout)
+     * -> TIMEOUT; Auth čtení a zápis nerozlišuje, u čtení TIMEOUT neškodí. */
+    struct kivfs_timeouts to;
+    kivfs_modconf_timeouts(kivfs_mod_conf(m), &to);
+    kivfs_mod_forward(m, from, req, &fwd, KIVFS_MOD_SYNC, to.op, KIVFS_STATUS_TIMEOUT);
     return 1;
 }
 
